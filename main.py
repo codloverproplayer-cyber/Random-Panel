@@ -3937,6 +3937,32 @@ def subscription_metadata_headers(used_bytes: int, limit_bytes: int, expires_at,
 # SINGLE SUB
 # ============================================================
 
+_VPN_CLIENT_HINTS = (
+    "v2ray", "hiddify", "streisand", "shadowrocket", "clash", "mihomo", "sing-box", "singbox",
+    "nekobox", "nekoray", "husi", "matsuri", "throne", "quantumult", "surge", "loon", "stash",
+    "karing", "v2box", "foxray", "happ", "flclash", "v2raytun", "incy", "okhttp", "curl",
+    "wget", "python", "go-http", "axios", "dart", "cfnetwork", "xray", "hysteria", "tuic",
+)
+
+
+def wants_html(request: Request) -> bool:
+    """True when a normal web browser opened the link (show the nice page).
+
+    VPN apps keep getting the raw base64 subscription. Override with
+    ?format=raw (always raw) or ?format=html (always page).
+    """
+    fmt = str(request.query_params.get("format", "") or "").lower()
+    if fmt in ("raw", "sub", "b64", "base64", "txt") or request.query_params.get("raw"):
+        return False
+    if fmt in ("html", "page", "info"):
+        return True
+    accept = str(request.headers.get("accept", "") or "").lower()
+    agent = str(request.headers.get("user-agent", "") or "").lower()
+    if "text/html" not in accept or "mozilla" not in agent:
+        return False
+    return not any(hint in agent for hint in _VPN_CLIENT_HINTS)
+
+
 @app.get("/sub/{uuid}")
 async def subscription_single(
     uuid: str,
@@ -3951,6 +3977,11 @@ async def subscription_single(
             status_code=404,
             detail="not found or inactive",
         )
+
+    if wants_html(request):
+        page = await info_page(uuid, request)
+        page.headers["Vary"] = "Accept, User-Agent"
+        return page
 
     host = get_host(request)
     clean_ips = link.get("clean_ips") or []
@@ -4002,6 +4033,7 @@ async def subscription_single(
         f"https://{host}/info/{uuid}",
         profile_title,
     )
+    headers["Vary"] = "Accept, User-Agent"
 
     return Response(
         content=content,
@@ -4993,6 +5025,10 @@ async def sub_group_subscription(
             detail="not found",
         )
 
+    # Browsers get the group page (it handles the password itself); apps get the raw sub.
+    if wants_html(request):
+        return RedirectResponse(url=f"/p/{uuid_key}", status_code=302)
+
     if sub.get(
         "password_hash"
     ):
@@ -5093,9 +5129,10 @@ async def sub_group_subscription(
         group_limit,
         group_expiry,
         host,
-        f"https://{host}/public-sub/{uuid_key}",
+        f"https://{host}/p/{uuid_key}",
         group_title,
     )
+    headers["Vary"] = "Accept, User-Agent"
 
     return Response(
         content=content,
