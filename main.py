@@ -39,7 +39,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ============================================================
 
 APP_NAME = "Aurora Panel"
-APP_VERSION = "14.0.0"
+APP_VERSION = "14.1.0"
 
 SUPPORT_USERNAME = "@logic_sec"
 SUPPORT_URL = "https://t.me/logic_sec"
@@ -231,6 +231,9 @@ PROTOCOLS = (
     "gaming-lite-demo",
 )
 
+# Only these transports are actually implemented by the relay (VLESS over WS / XHTTP).
+WORKING_PROTOCOLS = ("vless-ws", "xhttp-packet-up", "xhttp-stream-up", "xhttp-stream-one")
+
 PROTOCOL_LABELS = {
     "vless-ws": "VLESS WebSocket",
     "xhttp-packet-up": "XHTTP Packet Up",
@@ -398,7 +401,7 @@ def auto_config_name() -> str:
     return random_config_name()
 
 
-_NAME_STRIP_RE = re.compile(r"[\x00-\x1f\x7f​-‏‪-‮⁦-⁩﻿]")
+_NAME_STRIP_RE = re.compile(r"[\x00-\x1f\x7f\u200b\u200c\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
 
 
 def sanitize_display_name(name, max_len: int = 60) -> str:
@@ -429,7 +432,7 @@ def parse_config_names(raw, max_items: int = 40) -> list:
 
 
 # Transports this server really implements (VLESS over WebSocket / XHTTP).
-MULTI_PROTOCOLS = ("vless-ws", "xhttp-packet-up", "xhttp-stream-up", "xhttp-stream-one")
+MULTI_PROTOCOLS = WORKING_PROTOCOLS
 _ADDR_RE = re.compile(r"^[A-Za-z0-9._\-:\[\]]{1,253}$")
 
 
@@ -479,23 +482,62 @@ def default_label() -> str:
     return template.replace("{n}", str(highest + 1))
 
 
-def sub_config_names(link: dict, count: int) -> list:
+PROTOCOL_SHORT = {
+    "vless-ws": "Web Socket",
+    "xhttp-packet-up": "XHTTP Packet Up",
+    "xhttp-stream-up": "XHTTP Stream Up",
+    "xhttp-stream-one": "XHTTP Stream One",
+}
+_VAR_RE = re.compile(r"\{(\w+)\}")
+
+
+def render_name(template, protocol=None, i=1, address=None, port=None, host=None) -> str:
+    """Fill {protocol} {proto} {i} {n} {address} {port} {host} in a name. Unknown {x} stay as typed."""
+    proto = normalize_protocol(protocol)
+    values = {
+        "protocol": PROTOCOL_SHORT.get(proto, PROTOCOL_LABELS.get(proto, proto)),
+        "proto": proto,
+        "i": i,
+        "n": i,
+        "address": address or host or "",
+        "port": port or "",
+        "host": host or "",
+    }
+    return _VAR_RE.sub(
+        lambda m: str(values[m.group(1).lower()]) if m.group(1).lower() in values else m.group(0),
+        str(template or ""),
+    )
+
+
+def sub_config_names(link: dict, count: int, ctxs=None) -> list:
     """Names for the `count` configs inside one subscription.
 
     1. names typed in the panel (config_names) are used in order,
-    2. missing ones are filled as "<label>-2", "<label>-3", ...
+    2. missing ones use the label ("<label>-2", "<label>-3", ...; a label that
+       contains {variables} is used as-is for every config),
     3. a single config simply uses the label.
+    Variables such as {protocol} are filled per config from `ctxs`.
     """
     label = sanitize_display_name(link.get("label")) or "Config"
     custom = parse_config_names(link.get("config_names") or [])
+    has_var = bool(_VAR_RE.search(label))
     names, used = [], set()
     for i in range(count):
+        ctx = (ctxs[i] if ctxs and i < len(ctxs) else None) or {}
         if i < len(custom):
             base = custom[i]
-        elif count == 1:
+        elif count == 1 or has_var:
             base = label
         else:
             base = f"{label}-{i + 1}"
+        base = render_name(
+            base,
+            protocol=ctx.get("protocol") or link.get("protocol"),
+            i=i + 1,
+            address=ctx.get("address"),
+            port=ctx.get("port") or link.get("port"),
+            host=ctx.get("host"),
+        )
         name, n = base, 2
         while name in used:
             name = f"{base} ({n})"
@@ -1150,7 +1192,10 @@ def vless_link_for_link(
     return generate_vless_link(
         uid,
         host,
-        remark=str(link.get("label") or "Config"),
+        remark=render_name(
+            sanitize_display_name(link.get("label")) or "Config",
+            protocol=link.get("protocol"), i=1, host=host, port=link.get("port"),
+        ),
         protocol=link.get(
             "protocol",
             DEFAULT_PROTOCOL,
@@ -3326,7 +3371,7 @@ async def create_auto_link(
 @app.get("/api/protocols")
 async def api_protocols(request: Request):
     require_auth(request)
-    return {"protocols": [{"id": p, "label": PROTOCOL_LABELS.get(p, p)} for p in PROTOCOLS], "default": DEFAULT_PROTOCOL}
+    return {"protocols": [{"id": p, "label": PROTOCOL_LABELS.get(p, p)} for p in WORKING_PROTOCOLS], "default": DEFAULT_PROTOCOL}
 
 
 @app.get("/api/links")
@@ -4039,13 +4084,19 @@ def entry_lines(link: dict, uid: str, host: str) -> list:
     entries = link.get("entries") or []
     if not entries:
         return []
-    names = sub_config_names(link, len(entries))
+    ctxs = [
+        {"protocol": e.get("protocol"), "address": e.get("address") or host,
+         "port": e.get("port") or link.get("port", DEFAULT_PORT), "host": host}
+        for e in entries
+    ]
+    names = sub_config_names(link, len(entries), ctxs)
     out = []
-    for entry, default_name in zip(entries, names):
+    for idx, (entry, default_name) in enumerate(zip(entries, names)):
         proto = entry.get("protocol") or DEFAULT_PROTOCOL
+        c = ctxs[idx]
         out.append(generate_vless_link(
             uid, host,
-            remark=entry.get("name") or default_name,
+            remark=render_name(entry.get("name"), protocol=proto, i=idx + 1, address=c["address"], port=c["port"], host=host) if entry.get("name") else default_name,
             protocol=proto,
             fingerprint=link.get("fingerprint", DEFAULT_FINGERPRINT),
             alpn=link.get("alpn") if proto == link.get("protocol") else None,
@@ -4117,14 +4168,16 @@ async def subscription_single(
             time_text = str(expires_at)[:16]
     else:
         time_text = "∞"
-    label = str(link.get("label") or "Config")
+    label = render_name(
+        sanitize_display_name(link.get("label")) or "Config",
+        protocol=link.get("protocol"), i=1, host=host, port=link.get("port"),
+    )
     stats_remark = f"{label} | {volume_text} | {time_text}"
     stats_line = generate_vless_link(uuid, "0.0.0.0", remark=stats_remark, protocol=link.get("protocol", DEFAULT_PROTOCOL), fingerprint=link.get("fingerprint", DEFAULT_FINGERPRINT), alpn=link.get("alpn"), port=link.get("port", DEFAULT_PORT))
     lines = [stats_line]
     used_names = set()
     cfg_count = max(1, min(40, int(link.get("config_count") or 1)))
     multi = entry_lines(link, uuid, host)
-    names = sub_config_names(link, cfg_count)
     if multi:
         lines.extend(multi)
         hosts = []
@@ -4135,6 +4188,10 @@ async def subscription_single(
         hosts = hosts[:cfg_count]
     else:
         hosts = [host] * cfg_count
+    names = sub_config_names(
+        link, cfg_count,
+        [{"protocol": link.get("protocol"), "address": h, "port": link.get("port"), "host": host} for h in hosts],
+    ) if hosts else []
     for cip, name in zip(hosts, names):
         lines.append(generate_vless_link(uuid, cip, remark=name, protocol=link.get("protocol", DEFAULT_PROTOCOL), fingerprint=link.get("fingerprint", DEFAULT_FINGERPRINT), alpn=link.get("alpn"), port=link.get("port", DEFAULT_PORT)))
     content = base64.b64encode("\n".join(lines).encode()).decode()
@@ -4272,7 +4329,10 @@ async def info_page(
         svg_points = f"0,50 300,{60 - min(60, max(4, (usage_history[0] / (limit if limit > 0 else max(used, 1))) * 52)):.1f}"
 
     status_badge_html = 'text-emerald-300 border border-emerald-400/25 bg-emerald-400/10' if status_class == 'good' else 'text-rose-300 border border-rose-400/25 bg-rose-400/10'
-    label_escaped = escape_html(snapshot.get("label", "Aurora Panel"))
+    label_escaped = escape_html(render_name(
+        snapshot.get("label", "Aurora Panel"),
+        protocol=snapshot.get("protocol"), i=1, host=host, port=snapshot.get("port"),
+    ))
     uid_escaped = escape_html(uid)
     app_version_str = escape_html(str(APP_VERSION))
     used_bytes_str = escape_html(fmt_bytes(used))
@@ -4292,7 +4352,7 @@ async def info_page(
     vless_url_escaped = escape_html(vless_url)
     sub_url_escaped = escape_html(sub_url)
     _sub_q = quote(sub_url, safe="")
-    _name_q = quote(str(snapshot.get("label") or "Aurora Panel"), safe="")
+    _name_q = quote(render_name(snapshot.get("label") or "Aurora Panel", protocol=snapshot.get("protocol"), i=1, host=host, port=snapshot.get("port")), safe="")
     deeplink_v2rayng = escape_html(f"v2rayng://install-sub?url={_sub_q}&name={_name_q}")
     deeplink_hiddify = escape_html(f"hiddify://import/{sub_url}#{_name_q}")
     deeplink_streisand = escape_html(f"streisand://import/{sub_url}")
@@ -5708,7 +5768,7 @@ async def mix_subscription(request: Request, _=Depends(require_auth)):
             if multi:
                 lines.extend(multi)
                 continue
-            name = sub_config_names(link, 1)[0]
+            name = sub_config_names(link, 1, [{"protocol": link.get("protocol"), "address": host, "host": host}])[0]
             if name in used_names:
                 name = f"{name} ({len(used_names) + 1})"
             used_names.add(name)
@@ -7116,13 +7176,14 @@ tr:hover td{background:var(--hover)}
       <div class="card-title" data-i18n="manual_create">ساخت دستی</div>
       <div class="field"><label data-i18n="label_name">نام</label>
         <div style="display:flex;gap:8px;align-items:center">
-          <input id="cName" placeholder="auto" style="flex:1">
+          <input id="cName" placeholder="auto" style="flex:1" maxlength="60">
           <button type="button" class="btn btn-sm" onclick="randomName()" title="Random" style="min-width:44px;height:42px">
             <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M16 3h5v5M4 20L21 3M21 16v5h-5M15 15l6 6M4 4l5 5"/></svg>
           </button>
         </div>
       </div>
-            <div class="field"><label data-i18n="label_proto">پروتکـل</label><select id="cProto"></select></div>
+            <p class="hint">متغیرها: <b dir="ltr">{protocol}</b> نوع پروتکل (مثلاً Web Socket)، <b dir="ltr">{i}</b> شماره کانفیگ در ساب، <b dir="ltr">{address}</b> آدرس، <b dir="ltr">{port}</b> پورت. مثال: <b dir="ltr">Netherlands - {protocol}</b> (هر نویسه‌ای از جمله پرچم هم مجاز است)</p>
+      <div class="field"><label data-i18n="label_proto">پروتکـل</label><select id="cProto"></select></div>
       <div class="field"><label>گروه</label><select id="cGroup"></select></div>
 <div class="form-row">
         <div class="field"><label data-i18n="label_count">تعداد کانفیگ در ساب (۱–۴۰)</label><input id="cCount" type="number" value="1" min="1" max="40"></div>
@@ -7239,7 +7300,7 @@ tr:hover td{background:var(--hover)}
   
   <div class="card">
     <div class="card-title">نام پیش‌فرض کانفیگ</div>
-    <p class="hint">وقتی هنگام ساخت نام را خالی بگذارید، از این نام استفاده می‌شود. مثال: <b dir="ltr">Aurora</b> می‌شود Aurora-1، Aurora-2، ... یا با <b dir="ltr">Aurora {n}</b> جای شماره را خودتان تعیین کنید.</p>
+    <p class="hint">وقتی هنگام ساخت نام را خالی بگذارید، از این نام استفاده می‌شود. مثال: <b dir="ltr">Aurora</b> می‌شود Aurora-1، Aurora-2، ... یا با <b dir="ltr">Aurora {n}</b> جای شماره را خودتان تعیین کنید. متغیرهایی مثل <b dir="ltr">{protocol}</b> هم کار می‌کنند (در ساب با نوع پروتکل هر کانفیگ پر می‌شود).</p>
     <div class="field"><input id="sDefaultName" maxlength="40" placeholder="Aurora"></div>
     <div id="sDefaultNext" class="hint"></div>
     <button class="btn btn-p" onclick="saveDefaultName()"><span data-i18n="btn_save">ذخیـره</span></button>
@@ -7434,7 +7495,7 @@ tr:hover td{background:var(--hover)}
   <div class="modal">
     <div class="modal-title">ویرایش کانفیگ</div>
     <input type="hidden" id="eUid">
-    <div class="field"><label>نام کانفیگ / ساب</label><input id="eLabel" maxlength="60"></div>
+    <div class="field"><label>نام کانفیگ / ساب</label><input id="eLabel" maxlength="60"><p class="hint" style="margin-top:8px">متغیرها: <b dir="ltr">{protocol}</b> نوع پروتکل (مثلاً Web Socket)، <b dir="ltr">{i}</b> شماره کانفیگ در ساب، <b dir="ltr">{address}</b> آدرس، <b dir="ltr">{port}</b> پورت. مثال: <b dir="ltr">Netherlands - {protocol}</b> (هر نویسه‌ای از جمله پرچم هم مجاز است)</p></div>
     <div class="field"><label>تعداد کانفیگ در ساب (۱–۴۰)</label><input id="eCount" type="number" min="1" max="40" value="1"></div>
     <div class="field"><label>نام کانفیگ‌ها در ساب (هر خط یک نام، اختیاری)</label><textarea id="eNames" rows="4" placeholder="Config 1&#10;Config 2"></textarea></div>
       <div class="field"><label>پروتکل‌های چندگانه در ساب (اختیاری)</label>

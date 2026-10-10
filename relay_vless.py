@@ -116,6 +116,111 @@ async def relay_tcp_to_ws(ws: WebSocket, reader: asyncio.StreamReader, conn_id: 
     except Exception:
         pass
 
+# ══════════════════════════════════════════════════════════════════════════════
+# VLESS UDP (command 0x02) — بازی، صدا، QUIC و DNS روی UDP
+# بسته‌ها با پیشوند طول ۲ بایتی (big-endian) در WebSocket رد و بدل می‌شوند.
+# ══════════════════════════════════════════════════════════════════════════════
+
+UDP_IDLE_TIMEOUT = 120.0   # ثانیه بدون هیچ ترافیک در دو جهت
+
+
+class _UdpRelayProtocol(asyncio.DatagramProtocol):
+    def __init__(self, queue: asyncio.Queue):
+        self.queue = queue
+
+    def datagram_received(self, data, addr):
+        try:
+            self.queue.put_nowait(data)
+        except asyncio.QueueFull:
+            pass  # مثل یک سوکت UDP واقعی، بستهٔ اضافه حذف می‌شود
+
+    def error_received(self, exc):
+        pass
+
+
+def split_udp_frames(buf: bytearray) -> list:
+    """Pop every complete [len16][data] frame from buf; keep any partial tail."""
+    frames = []
+    while len(buf) >= 2:
+        size = int.from_bytes(buf[:2], "big")
+        if len(buf) < 2 + size:
+            break
+        frames.append(bytes(buf[2:2 + size]))
+        del buf[:2 + size]
+    return frames
+
+
+async def relay_udp(ws: WebSocket, address: str, port: int, payload: bytes, conn_id: str, uid: str):
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=2048)
+    transport, _ = await asyncio.wait_for(
+        loop.create_datagram_endpoint(lambda: _UdpRelayProtocol(queue), remote_addr=(address, port)),
+        timeout=10.0,
+    )
+    buf = bytearray()
+    last_activity = [loop.time()]
+
+    def push(chunk: bytes):
+        buf.extend(chunk)
+        for frame in split_udp_frames(buf):
+            if frame:
+                transport.sendto(frame)
+
+    async def from_ws():
+        try:
+            push(payload or b"")
+            while True:
+                msg = await ws.receive()
+                if msg["type"] == "websocket.disconnect":
+                    break
+                data = msg.get("bytes") or (msg.get("text") or "").encode()
+                if not data:
+                    continue
+                if not await check_and_use(uid, len(data)):
+                    await ws.close(code=1008, reason="quota/disabled/unknown")
+                    break
+                await throttle(uid, len(data))
+                connections[conn_id]["bytes"] += len(data)
+                last_activity[0] = loop.time()
+                push(data)
+        except (WebSocketDisconnect, Exception):
+            pass
+
+    async def to_ws():
+        first = True
+        try:
+            while True:
+                try:
+                    data = await asyncio.wait_for(queue.get(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    if loop.time() - last_activity[0] > UDP_IDLE_TIMEOUT:
+                        break
+                    continue
+                if not await check_and_use(uid, len(data)):
+                    await ws.close(code=1008, reason="quota/disabled/unknown")
+                    break
+                await throttle(uid, len(data))
+                connections[conn_id]["bytes"] += len(data)
+                last_activity[0] = loop.time()
+                frame = len(data).to_bytes(2, "big") + data
+                await ws.send_bytes((b"\x00\x00" + frame) if first else frame)
+                first = False
+        except Exception:
+            pass
+
+    tasks = [asyncio.create_task(from_ws()), asyncio.create_task(to_ws())]
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for t in tasks:
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+        transport.close()
+
+
 async def websocket_tunnel(ws: WebSocket, uuid: str):
     await ws.accept()
 
@@ -164,6 +269,13 @@ async def websocket_tunnel(ws: WebSocket, uuid: str):
         stats["total_requests"] += 1
         connections[conn_id]["bytes"] += len(first_chunk)
         logger.info(f"➡️  [{conn_id}] → {address}:{port}")
+
+        if command == 2:
+            # UDP (games / voice / QUIC / DNS)
+            connections[conn_id]["transport"] = "vless-ws-udp"
+            await relay_udp(ws, address, port, payload, conn_id, uuid)
+            asyncio.create_task(save_state())
+            return
 
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(address, port),

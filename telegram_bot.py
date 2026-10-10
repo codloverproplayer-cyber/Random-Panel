@@ -20,6 +20,7 @@ from main import (
     is_link_expired,
     logger,
     PROTOCOLS,
+    WORKING_PROTOCOLS,
     DEFAULT_PROTOCOL,
     FINGERPRINTS,
     DEFAULT_FINGERPRINT,
@@ -338,7 +339,7 @@ def _wizard_cancel_kb():
 
 
 def _wizard_protocol_kb():
-    rows = [[{"text": _protocol_label(p), "callback_data": f"w:proto:{p}"}] for p in list(PROTOCOLS)[:12]]
+    rows = [[{"text": _protocol_label(p), "callback_data": f"w:proto:{p}"}] for p in list(WORKING_PROTOCOLS)[:12]]
     rows.append([{"text": "❌ انصراف", "callback_data": "w:cancel"}])
     return {"inline_keyboard": rows}
 
