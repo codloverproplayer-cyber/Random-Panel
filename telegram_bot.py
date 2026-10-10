@@ -1162,7 +1162,7 @@ async def start_bot(mode: str = "polling"):
         await _call("setMyName", name=BOT_NAME)
         await _call(
             "setMyDescription",
-            description=f"{BOT_NAME} ({BOT_NAME_EN}) — مدیریت کامل پنل PXPanel از تلگرام",
+            description=f"{BOT_NAME} ({BOT_NAME_EN}) — مدیریت کامل پنل Aurora Panel از تلگرام",
         )
         await _call(
             "setMyCommands",

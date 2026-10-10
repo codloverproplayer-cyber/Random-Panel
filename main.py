@@ -1,5 +1,5 @@
 # ============================================================
-# PXPanel 13.8.0
+# Aurora Panel
 # Railway Ready
 # Created By PIXON
 # ============================================================
@@ -38,8 +38,8 @@ from fastapi.middleware.cors import CORSMiddleware
 # APP
 # ============================================================
 
-APP_NAME = "PXPanel"
-APP_VERSION = "13.11.0"
+APP_NAME = "Aurora Panel"
+APP_VERSION = "14.0.0"
 
 SUPPORT_USERNAME = "@logic_sec"
 SUPPORT_URL = "https://t.me/logic_sec"
@@ -193,6 +193,7 @@ SUBS: dict = {}
 SESSIONS: dict = {}
 connections: dict = {}
 CATEGORIES: dict = {}
+SETTINGS: dict = {"default_name": ""}
 
 stats = {
     "total_bytes": 0,
@@ -231,7 +232,7 @@ PROTOCOLS = (
 )
 
 PROTOCOL_LABELS = {
-    "vless-ws": "VLESS WebSocket ⭐",
+    "vless-ws": "VLESS WebSocket",
     "xhttp-packet-up": "XHTTP Packet Up",
     "xhttp-stream-up": "XHTTP Stream Up",
     "xhttp-stream-one": "XHTTP Stream One",
@@ -425,6 +426,57 @@ def parse_config_names(raw, max_items: int = 40) -> list:
         if len(out) >= max_items:
             break
     return out
+
+
+# Transports this server really implements (VLESS over WebSocket / XHTTP).
+MULTI_PROTOCOLS = ("vless-ws", "xhttp-packet-up", "xhttp-stream-up", "xhttp-stream-one")
+_ADDR_RE = re.compile(r"^[A-Za-z0-9._\-:\[\]]{1,253}$")
+
+
+def parse_entries(raw, max_items: int = 40) -> list:
+    """Normalise multi-protocol entries: [{protocol, address, sni, name, port}]."""
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        proto = normalize_protocol(item.get("protocol"))
+        if proto not in MULTI_PROTOCOLS:
+            continue
+        entry = {"protocol": proto}
+        for key in ("address", "sni"):
+            val = str(item.get(key) or "").strip()
+            if val and _ADDR_RE.match(val):
+                entry[key] = val
+        name = sanitize_display_name(item.get("name"))
+        if name:
+            entry["name"] = name
+        try:
+            port = int(item.get("port") or 0)
+        except Exception:
+            port = 0
+        if MIN_PORT <= port <= MAX_PORT:
+            entry["port"] = port
+        out.append(entry)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def default_label() -> str:
+    """Name used when the creator leaves the name empty (Settings -> default name)."""
+    base = sanitize_display_name(SETTINGS.get("default_name"))
+    if not base:
+        return random_config_name()
+    template = base if "{n}" in base else base + "-{n}"
+    pattern = re.compile("^" + re.escape(template).replace(re.escape("{n}"), r"(\d+)") + "$")
+    highest = 0
+    for link in LINKS.values():
+        m = pattern.match(str(link.get("label") or ""))
+        if m:
+            highest = max(highest, int(m.group(1)))
+    return template.replace("{n}", str(highest + 1))
 
 
 def sub_config_names(link: dict, count: int) -> list:
@@ -1045,25 +1097,32 @@ def set_auth_cookie(
 # ============================================================
 
 def generate_vless_link(
-    uuid: str, host: str, remark: str = "PXPanel",
+    uuid: str, host: str, remark: str = "Aurora",
     protocol: str = DEFAULT_PROTOCOL, fingerprint: str | None = None,
     alpn: str | None = None, port: int | None = None,
+    address: str | None = None, sni: str | None = None,
 ):
+    """address = where the client connects (IP/domain); sni = TLS server name + Host header.
+
+    Both default to `host`, so existing callers behave exactly as before.
+    """
     protocol = normalize_protocol(protocol)
+    server = (address or "").strip() or host
+    host = (sni or "").strip() or host
     fp = (fingerprint or DEFAULT_FINGERPRINT).strip().lower()
     if fp not in FINGERPRINTS: fp = DEFAULT_FINGERPRINT
     port_value = safe_int(port, DEFAULT_PORT, MIN_PORT, MAX_PORT)
     alpn_value = (alpn or DEFAULT_ALPN_BY_PROTOCOL.get(protocol, "http/1.1")).strip()
-    label = quote(str(remark or "PXPanel"), safe="")
+    label = quote(str(remark or "Aurora"), safe="")
     if protocol == "vless-ws":
         q = {"encryption":"none","security":"tls","type":"ws","host":host,"path":f"/ws/{uuid}","sni":host,"fp":fp,"alpn":alpn_value}
-        return "vless://" + uuid + "@" + host + ":" + str(port_value) + "?" + "&".join(f"{k}={quote(str(v), safe=',/') }" for k,v in q.items()) + "#" + label
+        return "vless://" + uuid + "@" + server + ":" + str(port_value) + "?" + "&".join(f"{k}={quote(str(v), safe=',/') }" for k,v in q.items()) + "#" + label
     if protocol.startswith("xhttp-"):
         mode = protocol.replace("xhttp-", "")
         q = {"encryption":"none","security":"tls","type":"xhttp","mode":mode,"host":host,"path":f"/xhttp-siz10/{mode}/{uuid}","sni":host,"fp":fp,"alpn":alpn_value}
-        return "vless://" + uuid + "@" + host + ":" + str(port_value) + "?" + "&".join(f"{k}={quote(str(v), safe=',/') }" for k,v in q.items()) + "#" + label
+        return "vless://" + uuid + "@" + server + ":" + str(port_value) + "?" + "&".join(f"{k}={quote(str(v), safe=',/') }" for k,v in q.items()) + "#" + label
     if protocol == "vmess-ws":
-        raw = {"v":"2","ps":remark,"add":host,"port":port_value,"id":uuid,"aid":0,"scy":"auto","net":"ws","type":"none","host":host,"path":f"/ws/{uuid}","tls":"tls","sni":host,"fp":fp}
+        raw = {"v":"2","ps":remark,"add":server,"port":port_value,"id":uuid,"aid":0,"scy":"auto","net":"ws","type":"none","host":host,"path":f"/ws/{uuid}","tls":"tls","sni":host,"fp":fp}
         return "vmess://" + base64.b64encode(json.dumps(raw,separators=(",",":"),ensure_ascii=False).encode()).decode()
     if protocol == "trojan-ws":
         return f"trojan://{uuid}@{host}:{port_value}?security=tls&type=ws&host={quote(host)}&path={quote('/ws/'+uuid)}&sni={quote(host)}#{label}"
@@ -1078,7 +1137,7 @@ def generate_vless_link(
     if protocol == "wireguard": return f"wireguard://{uuid}@{host}:{port_value}?publicKey={uuid}#{label}"
     if protocol == "highspeed-demo":
         q = {"encryption":"none","security":"tls","type":"xhttp","mode":"stream-up","host":host,"path":f"/xhttp-siz10/stream-up/{uuid}","sni":host,"fp":fp,"alpn":"h2,http/1.1"}
-        return "vless://" + uuid + "@" + host + ":" + str(port_value) + "?" + "&".join(f"{k}={quote(str(v), safe=',/')}" for k,v in q.items()) + "#" + label
+        return "vless://" + uuid + "@" + server + ":" + str(port_value) + "?" + "&".join(f"{k}={quote(str(v), safe=',/')}" for k,v in q.items()) + "#" + label
     if protocol == "gaming-lite-demo":
         return f"hysteria2://{uuid}@{host}:{port_value}/?sni={quote(host)}&insecure=0&obfs=salamander#{label}"
     return f"vless://{uuid}@{host}:{port_value}"
@@ -1155,6 +1214,7 @@ def get_link_info(
         "category_name": str(cat.get("name", "عمومی")),
         "config_count": cfg_count,
         "config_names": list(link.get("config_names") or []),
+        "entries": list(link.get("entries") or []),
         "status_color": status_color,
         "connected_ips": connected_count,
         "show_vless": show_vless,
@@ -1213,6 +1273,8 @@ async def load_state():
                 {},
             )
         )
+
+        SETTINGS.update(data.get("settings") or {})
 
         ADMIN_ACCOUNTS.clear()
         ADMIN_ACCOUNTS.update(data.get("admin_accounts") or {})
@@ -1314,6 +1376,9 @@ async def save_state():
                 "categories":
                     dict(CATEGORIES),
 
+                "settings":
+                    dict(SETTINGS),
+
                 "admin_accounts":
                     dict(ADMIN_ACCOUNTS),
 
@@ -1373,18 +1438,19 @@ async def backup_state(_=Depends(require_auth)):
     async with SUBS_LOCK:
         subs = json.loads(json.dumps(SUBS, ensure_ascii=False))
     payload = {
-        "format": "pxpanel-backup",
+        "format": "aurora-backup",
         "version": APP_VERSION,
         "created_at": datetime.now().isoformat(),
         "links": links,
         "subs": subs,
         "categories": json.loads(json.dumps(CATEGORIES, ensure_ascii=False)),
+        "settings": dict(SETTINGS),
     }
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     return Response(
         content=json.dumps(payload, ensure_ascii=False, indent=2),
         media_type="application/json; charset=utf-8",
-        headers={"content-disposition": f'attachment; filename="pxpanel-backup-{stamp}.json"'},
+        headers={"content-disposition": f'attachment; filename="aurora-backup-{stamp}.json"'},
     )
 
 
@@ -1436,9 +1502,39 @@ async def restore_state(request: Request, _=Depends(require_auth)):
     for cid, cat in cats.items():
         if isinstance(cat, dict):
             CATEGORIES[cid] = cat
+    if isinstance(body.get("settings"), dict) and not SETTINGS.get("default_name"):
+        SETTINGS["default_name"] = sanitize_display_name(body["settings"].get("default_name"), 40)
     await save_state()
     log_activity("system", f"Backup restored: {len(links)} links", "ok")
     return {"ok": True, "links": len(links), "subs": len(subs), "categories": len(cats)}
+
+
+# ============================================================
+# SETTINGS (default config name)
+# ============================================================
+
+def _settings_payload() -> dict:
+    name = SETTINGS.get("default_name") or ""
+    return {"default_name": name, "next_name": default_label() if name else ""}
+
+
+@app.get("/api/settings")
+async def get_settings(_=Depends(require_auth)):
+    return _settings_payload()
+
+
+@app.post("/api/settings")
+async def save_settings(request: Request, _=Depends(require_auth)):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="JSON نامعتبر")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="JSON نامعتبر")
+    if "default_name" in body:
+        SETTINGS["default_name"] = sanitize_display_name(body.get("default_name"), 40)
+    await save_state()
+    return {"ok": True, **_settings_payload()}
 
 
 # ============================================================
@@ -1566,6 +1662,7 @@ async def make_link(
     category_id: str = "0",
     config_count: int = 1,
     config_names=None,
+    entries=None,
 ):
 
     protocol = normalize_protocol(protocol)
@@ -1589,7 +1686,7 @@ async def make_link(
 
     record = {
         "label":
-            sanitize_display_name(label) or random_config_name(),
+            sanitize_display_name(label) or default_label(),
 
         "limit_bytes":
             max(
@@ -1668,8 +1765,12 @@ async def make_link(
         "category_id": str(category_id or "0"),
         "config_count": max(1, min(40, int(config_count or 1))),
         "config_names": parse_config_names(config_names or []),
+        "entries": parse_entries(entries or []),
         "usage_history": [],
     }
+
+    if record["entries"]:
+        record["config_count"] = len(record["entries"])
 
     async with LINKS_LOCK:
         LINKS[uid] = record
@@ -2072,7 +2173,7 @@ LANDING_HTML = r"""
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 
-<title>PX Panel</title>
+<title>Aurora Panel</title>
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -2277,7 +2378,7 @@ h1{
     }
 }
 
-/* PXPanel 13.0.1 responsive system */
+/* Aurora Panel 13.0.1 responsive system */
 html{scroll-behavior:smooth} body{overflow-x:hidden} button,input,select,textarea{touch-action:manipulation} .modal{overscroll-behavior:contain}
 @media(max-width:900px){.container,.shell,.dashboard,.main,.content{max-width:100%!important;width:100%!important}.grid,.stats-grid,.cards-grid,.form-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}.sidebar{z-index:1000}}
 @media(max-width:640px){body{padding:10px!important;font-size:14px}.grid,.stats-grid,.cards-grid,.form-grid{grid-template-columns:1fr!important}.card,.panel,.section,.modal{border-radius:18px!important}.modal{max-height:92vh;overflow:auto;padding:14px!important}.header,.topbar,.toolbar,.actions{flex-wrap:wrap!important}.header>* ,.topbar>*{max-width:100%}.btn,button{min-height:44px}.field input,.field select,.field textarea,input,select,textarea{min-height:44px;font-size:16px;max-width:100%}table{display:block;overflow-x:auto;white-space:nowrap}.link-row,.config-row{flex-direction:column!important;align-items:stretch!important}.brand-name{font-size:15px}}
@@ -2316,16 +2417,13 @@ table th:first-child, table td:first-child{overflow:visible}
 
 <div class="brand">
 
-<div class="logo">P</div>
+<div class="logo">A</div>
 
 <div>
 <div class="brand-name">
-PX Panel
+Aurora Panel
 </div>
 
-<div class="version">
-13.8.0
-</div>
 </div>
 
 </div>
@@ -2341,7 +2439,7 @@ PX Panel
 </h1>
 
 <div class="desc">
-این صفحه، درگاه عمومی PX Panel است.
+این صفحه، درگاه عمومی Aurora Panel است.
 برای دسترسی به داشبورد مدیریت از مسیر ورود استفاده کنید.
 </div>
 
@@ -2358,30 +2456,14 @@ class="btn primary"
 ورود به پنل
 </a>
 
-<a
-href="https://t.me/Pixonal"
-target="_blank"
-rel="noopener"
-class="btn secondary"
->
-پشتیبانی
-</a>
 
 </div>
 
 <div class="footer">
 
 <span>
-PX Panel · 13.8.0
+Aurora Panel
 </span>
-
-<a
-href="https://t.me/Pixonal"
-target="_blank"
-class="support"
->
-@Pixonal
-</a>
 
 </div>
 
@@ -3144,8 +3226,10 @@ async def create_link_api(
         if ip_limit == 0: ip_limit = 1
         if connection_limit == 0: connection_limit = 1
     label_val = body.get("label", "")
-    if cat.get("random_name") or not sanitize_display_name(label_val):
+    if cat.get("random_name"):
         label_val = random_config_name()
+    elif not sanitize_display_name(label_val):
+        label_val = default_label()
     else:
         label_val = sanitize_display_name(label_val)
 
@@ -3179,6 +3263,7 @@ async def create_link_api(
         category_id=category_id,
         config_count=config_count,
         config_names=body.get("config_names"),
+        entries=body.get("entries"),
     )
 
     host = get_host(request)
@@ -3221,9 +3306,9 @@ async def create_auto_link(
     cfg = profiles.get(profile, profiles["balanced"])
     config_count = safe_int(body.get("config_count", 1), minimum=1, maximum=40)
     uid, link = await make_link(
-        label=auto_config_name(), limit_bytes=0, expires_at=None,
+        label=default_label(), limit_bytes=0, expires_at=None,
         ip_limit=cfg["ip"], speed_limit_bytes=cfg["speed"], connection_limit=cfg["conn"],
-        note=f"Auto generated by PXPanel | profile={profile}",
+        note=f"Auto generated by Aurora Panel | profile={profile}",
         protocol=protocol, fingerprint=cfg["fp"],
         alpn=DEFAULT_ALPN_BY_PROTOCOL.get(protocol, ""), port=443, fragment=cfg["fragment"],
         config_count=config_count,
@@ -3483,6 +3568,11 @@ async def update_link(
             link["config_count"] = safe_int(
                 body.get("config_count", 1), minimum=1, maximum=40
             )
+
+        if "entries" in body:
+            link["entries"] = parse_entries(body.get("entries"))
+            if link["entries"]:
+                link["config_count"] = len(link["entries"])
 
         if "note" in body:
 
@@ -3921,13 +4011,12 @@ def subscription_metadata_headers(used_bytes: int, limit_bytes: int, expires_at,
     # Header values must be ASCII, so the title is sent as "base64:<utf8 b64>".
     # v2rayNG / v2rayN / Hiddify / Streisand decode this to the real name.
     # (The old percent-encoded form was shown raw by some clients: %20%20...)
-    title = sanitize_display_name(title, 120) or "PXPanel"
+    title = sanitize_display_name(title, 120) or "Aurora Panel"
     safe_name = quote(title, safe="")
 
     return {
         "profile-title": "base64:" + base64.b64encode(title.encode("utf-8")).decode("ascii"),
         "profile-web-page-url": info_url,
-        "support-url": SUPPORT_URL,
         "profile-update-interval": "12",
         "subscription-userinfo": userinfo,
         "content-disposition": f"inline; filename=\"subscription.txt\"; filename*=UTF-8''{safe_name}",
@@ -3943,6 +4032,28 @@ _VPN_CLIENT_HINTS = (
     "karing", "v2box", "foxray", "happ", "flclash", "v2raytun", "incy", "okhttp", "curl",
     "wget", "python", "go-http", "axios", "dart", "cfnetwork", "xray", "hysteria", "tuic",
 )
+
+
+def entry_lines(link: dict, uid: str, host: str) -> list:
+    """One share link per multi-protocol entry (empty list when the link has none)."""
+    entries = link.get("entries") or []
+    if not entries:
+        return []
+    names = sub_config_names(link, len(entries))
+    out = []
+    for entry, default_name in zip(entries, names):
+        proto = entry.get("protocol") or DEFAULT_PROTOCOL
+        out.append(generate_vless_link(
+            uid, host,
+            remark=entry.get("name") or default_name,
+            protocol=proto,
+            fingerprint=link.get("fingerprint", DEFAULT_FINGERPRINT),
+            alpn=link.get("alpn") if proto == link.get("protocol") else None,
+            port=entry.get("port") or link.get("port", DEFAULT_PORT),
+            address=entry.get("address"),
+            sni=entry.get("sni"),
+        ))
+    return out
 
 
 def wants_html(request: Request) -> bool:
@@ -4012,8 +4123,12 @@ async def subscription_single(
     lines = [stats_line]
     used_names = set()
     cfg_count = max(1, min(40, int(link.get("config_count") or 1)))
+    multi = entry_lines(link, uuid, host)
     names = sub_config_names(link, cfg_count)
-    if clean_ips:
+    if multi:
+        lines.extend(multi)
+        hosts = []
+    elif clean_ips:
         hosts = list(clean_ips)
         while len(hosts) < cfg_count:
             hosts.extend(clean_ips)
@@ -4157,7 +4272,7 @@ async def info_page(
         svg_points = f"0,50 300,{60 - min(60, max(4, (usage_history[0] / (limit if limit > 0 else max(used, 1))) * 52)):.1f}"
 
     status_badge_html = 'text-emerald-300 border border-emerald-400/25 bg-emerald-400/10' if status_class == 'good' else 'text-rose-300 border border-rose-400/25 bg-rose-400/10'
-    label_escaped = escape_html(snapshot.get("label", "PXpanel"))
+    label_escaped = escape_html(snapshot.get("label", "Aurora Panel"))
     uid_escaped = escape_html(uid)
     app_version_str = escape_html(str(APP_VERSION))
     used_bytes_str = escape_html(fmt_bytes(used))
@@ -4168,12 +4283,16 @@ async def info_page(
     ip_limit_escaped = escape_html(ip_limit)
     connection_limit_escaped = escape_html(connection_limit)
     speed_limit_escaped = escape_html(speed_limit)
-    protocol_escaped = escape_html(snapshot.get("protocol", "vless-ws"))
+    _entries = snapshot.get("entries") or []
+    if _entries:
+        protocol_escaped = escape_html("multi: " + ", ".join(dict.fromkeys(e.get("protocol", "") for e in _entries)))
+    else:
+        protocol_escaped = escape_html(snapshot.get("protocol", "vless-ws"))
     fingerprint_escaped = escape_html(snapshot.get("fingerprint", "chrome"))
     vless_url_escaped = escape_html(vless_url)
     sub_url_escaped = escape_html(sub_url)
     _sub_q = quote(sub_url, safe="")
-    _name_q = quote(str(snapshot.get("label") or "PXPanel"), safe="")
+    _name_q = quote(str(snapshot.get("label") or "Aurora Panel"), safe="")
     deeplink_v2rayng = escape_html(f"v2rayng://install-sub?url={_sub_q}&name={_name_q}")
     deeplink_hiddify = escape_html(f"hiddify://import/{sub_url}#{_name_q}")
     deeplink_streisand = escape_html(f"streisand://import/{sub_url}")
@@ -4298,7 +4417,7 @@ async def info_page(
         </div>
         <div class="min-w-0">
           <h1 class="text-lg sm:text-xl md:text-2xl font-black tracking-tight truncate">{label_escaped}</h1>
-          <p class="mt-1.5 text-[10.5px] sm:text-[11px] text-white/40 break-all">UUID: {uid_escaped} &nbsp;·&nbsp; PXpanel {app_version_str}</p>
+          <p class="mt-1.5 text-[10.5px] sm:text-[11px] text-white/40 break-all">UUID: {uid_escaped}</p>
         </div>
       </div>
       <div class="flex items-center gap-2.5 self-start md:self-auto flex-wrap">
@@ -4585,10 +4704,6 @@ async def info_page(
     </div>
   </section>
 
-  <!-- Footer -->
-  <div class="rounded-2xl border border-emerald-400/15 bg-emerald-400/[0.05] p-4 text-center text-xs text-white/45">
-    پشتیبانی و اطلاعیه‌ها &nbsp;·&nbsp; <b class="text-emerald-300">کانال تلگرام: logic_sec</b>
-  </div>
 
 </div>
 
@@ -4603,7 +4718,7 @@ async def info_page(
 <!-- QR Code Modal Popup -->
 <div id="qrModal" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md hidden">
   <div class="w-full max-w-sm rounded-[24px] border border-white/15 bg-[#0b0c14] p-6 text-center shadow-2xl relative">
-    <button type="button" onclick="closeQrModal()" class="absolute top-4 left-4 w-8 h-8 rounded-full bg-white/5 border border-white/10 grid place-items-center text-white/60 hover:text-white">✕</button>
+    <button type="button" onclick="closeQrModal()" class="absolute top-4 left-4 w-8 h-8 rounded-full bg-white/5 border border-white/10 grid place-items-center text-white/60 hover:text-white"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
     <p class="text-sm font-black text-white/90 mb-2">QR Code اسکن کانفیگ</p>
     <p class="text-[11px] text-white/40 mb-4">برای اتصال سریع با گوشی موبایل</p>
     <div id="qrcodeContainer" class="bg-white p-4 rounded-2xl inline-block mx-auto mb-4 border border-white/10"></div>
@@ -5072,12 +5187,9 @@ async def sub_group_subscription(
                 )
             ):
 
-                lines.append(
-                    vless_link_for_link(
-                        link,
-                        link_id,
-                        host,
-                    )
+                lines.extend(
+                    entry_lines(link, link_id, host)
+                    or [vless_link_for_link(link, link_id, host)]
                 )
 
     content = (
@@ -5123,7 +5235,7 @@ async def sub_group_subscription(
         else f"{fmt_bytes(total_used)}/∞"
     )
     group_expiry_text = group_expiry or "∞"
-    group_title = str(sub.get("name") or "PXPanel")
+    group_title = str(sub.get("name") or "Aurora Panel")
     headers = subscription_metadata_headers(
         total_used,
         group_limit,
@@ -5158,7 +5270,7 @@ content="width=device-width,initial-scale=1"
 >
 
 <title>
-PX Panel
+Aurora Panel
 </title>
 
 <style>
@@ -5253,12 +5365,8 @@ h1{
 <div class="card">
 
 <h1>
-PX Panel
+Aurora Panel
 </h1>
-
-<div class="version">
-13.8.0
-</div>
 
 <div class="text">
 اشتراک شما آماده است.
@@ -5269,14 +5377,6 @@ class="url"
 id="subUrl"
 ></div>
 
-<a
-class="support"
-href="https://t.me/Pixonal"
-target="_blank"
-rel="noopener"
->
-پشتیبانی @Pixonal
-</a>
 
 </div>
 
@@ -5604,6 +5704,10 @@ async def mix_subscription(request: Request, _=Depends(require_auth)):
             labels.append(str(link.get("label") or lid[:8]))
             total_used += int(link.get("used_bytes", 0) or 0)
             total_limit += int(link.get("limit_bytes", 0) or 0)
+            multi = entry_lines(link, lid, host)
+            if multi:
+                lines.extend(multi)
+                continue
             name = sub_config_names(link, 1)[0]
             if name in used_names:
                 name = f"{name} ({len(used_names) + 1})"
@@ -6663,7 +6767,7 @@ DASHBOARD_HTML = r"""
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-<title>PXPanel</title>
+<title>Aurora Panel</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -6784,6 +6888,11 @@ tr:hover td{background:var(--hover)}
 .range-tab.on{background:var(--accent);color:#fff;box-shadow:0 2px 8px rgba(13,148,136,.35)}
 
 .field{margin-bottom:14px}
+.entry-row{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:10px;border:1px solid var(--card-b);border-radius:12px;margin-bottom:8px;background:var(--bg3)}
+.entry-row .er-proto{grid-column:1 / -1}
+.entry-row .er-del{grid-column:1 / -1;justify-self:end}
+.hint{font-size:11px;color:var(--t3);line-height:1.8;margin:2px 0 10px}
+.entry-actions{display:flex;gap:8px;flex-wrap:wrap}
 .field label{display:block;font-size:11px;color:var(--t3);margin-bottom:6px;font-weight:700}
 .field input,.field select,.field textarea{width:100%;padding:11px 13px;border-radius:11px;border:1px solid var(--card-b);background:var(--input-bg);color:var(--t1);font-family:inherit;font-size:13px;outline:none;transition:.15s}
 .field input:focus,.field select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(20,184,166,.15)}
@@ -6847,7 +6956,7 @@ tr:hover td{background:var(--hover)}
 <body>
 
 <div class="mob-bar">
-  <div style="font-weight:800;font-size:15px">PXPanel</div>
+  <div style="font-weight:800;font-size:15px">Aurora Panel</div>
   <button class="btn btn-sm" id="mobMenuBtn" aria-label="menu">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
   </button>
@@ -6859,9 +6968,9 @@ tr:hover td{background:var(--hover)}
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
   </button>
   <div class="sb-logo">
-    <div class="sb-logo-icon">PX</div>
+    <div class="sb-logo-icon"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round"><path d="M3 15c3-6 6-6 9 0s6 6 9 0"/><path d="M3 9c3-6 6-6 9 0s6 6 9 0" opacity=".55"/></svg></div>
     <div class="sb-logo-text">
-      <div class="sb-logo-name">PXPanel</div>
+      <div class="sb-logo-name">Aurora Panel</div>
       <div class="sb-logo-ver">v13.9.4</div>
     </div>
   </div>
@@ -7020,6 +7129,14 @@ tr:hover td{background:var(--hover)}
         <div class="field"><label data-i18n="label_days">انقضـا (روز)</label><input id="cDays" type="number" value="0" min="0"></div>
       </div>
       <div class="field"><label>نام کانفیگ‌ها در ساب (هر خط یک نام، اختیاری)</label><textarea id="cNames" rows="3" placeholder="Config 1&#10;Config 2"></textarea></div>
+      <div class="field"><label>پروتکل‌های چندگانه در ساب (اختیاری)</label>
+        <p class="hint">هر ردیف یک کانفیگ جدا در ساب می‌سازد. «آدرس» همان جایی است که برنامه به آن وصل می‌شود (آی‌پی یا دامنه)؛ اگر روی یک شبکه کار نکرد، آدرس دیگری وارد کنید. خالی بماند یعنی دامنه پنل. SNI/Host را معمولاً خالی بگذارید. با داشتن ردیف، «تعداد کانفیگ» نادیده گرفته می‌شود.</p>
+        <div id="cEntries"></div>
+        <div class="entry-actions">
+          <button type="button" class="btn btn-sm" onclick="addEntryRow('cEntries')"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg><span>افزودن پروتکل</span></button>
+          <button type="button" class="btn btn-sm" onclick="addAllEntryRows('cEntries')"><span>هر ۴ نوع</span></button>
+        </div>
+      </div>
       <div class="form-row">
         <div class="field"><label data-i18n="label_limit">محدودیت حجم</label><input id="cLimit" type="number" value="0" min="0"></div>
         <div class="field"><label data-i18n="label_unit">واحد</label><select id="cUnit"><option>GB</option><option>MB</option><option>KB</option></select></div>
@@ -7121,6 +7238,14 @@ tr:hover td{background:var(--hover)}
   </div>
   
   <div class="card">
+    <div class="card-title">نام پیش‌فرض کانفیگ</div>
+    <p class="hint">وقتی هنگام ساخت نام را خالی بگذارید، از این نام استفاده می‌شود. مثال: <b dir="ltr">Aurora</b> می‌شود Aurora-1، Aurora-2، ... یا با <b dir="ltr">Aurora {n}</b> جای شماره را خودتان تعیین کنید.</p>
+    <div class="field"><input id="sDefaultName" maxlength="40" placeholder="Aurora"></div>
+    <div id="sDefaultNext" class="hint"></div>
+    <button class="btn btn-p" onclick="saveDefaultName()"><span data-i18n="btn_save">ذخیـره</span></button>
+  </div>
+
+  <div class="card">
     <div class="card-title">بکاپ و بازیابی</div>
     <p style="font-size:12px;color:var(--t3);line-height:1.8;margin-bottom:12px">کانفیگ‌ها، گروه‌ها و دسته‌ها را دانلود کنید. رمز عبور در بکاپ ذخیره نمی‌شود. بازیابی فقط ادغام می‌کند و چیزی را حذف نمی‌کند.</p>
     <div style="display:flex;gap:10px;flex-wrap:wrap">
@@ -7218,12 +7343,12 @@ tr:hover td{background:var(--hover)}
   </div>
   <div style="display:flex;justify-content:center;width:100%">
   <div class="card" style="max-width:560px;width:100%;line-height:2;font-size:14px;color:var(--t2);text-align:center">
-    <div style="font-size:16px;font-weight:800;color:var(--t1);margin-bottom:12px">💖 حمایت از پروژه (اختیاری)</div>
-    <p>اگه از پروژه خوشتون اومده یا براتون مفید بوده، می‌تونید با یه حمایت کوچیک مالی به ادامه‌ی توسعه و بهتر شدن پروژه کمک کنید. 🫶🏻✨</p>
-    <p style="margin-top:10px">💰 هر مقدار حمایتی، حتی کم، برای ما ارزشمنده و باعث میشه با انگیزه‌ی بیشتری ادامه بدیم! 🚀❤️‍🔥</p>
-    <p style="margin-top:10px">🔗 لینک حمایت مالی:</p>
-    <div style="margin-top:12px;display:flex;justify-content:center"><a href="https://reymit.ir/moditor" target="_blank" rel="noopener" class="btn btn-p" style="display:inline-flex;text-decoration:none">🙂 reymit.ir/moditor</a></div>
-    <p style="margin-top:16px;font-size:13px;color:var(--t3)">🙏🏻 ممنون از حمایت و همراهی‌تون عشقا! ❤️‍🔥🌹</p>
+    <div style="font-size:16px;font-weight:800;color:var(--t1);margin-bottom:12px"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px;margin-inline-end:6px;color:var(--pink)"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1-1.1a5.5 5.5 0 0 0-7.8 7.8l1 1.1L12 21l7.8-7.5 1-1.1a5.5 5.5 0 0 0 0-7.8z"/></svg>حمایت از پروژه (اختیاری)</div>
+    <p>اگه از پروژه خوشتون اومده یا براتون مفید بوده، می‌تونید با یه حمایت کوچیک مالی به ادامه‌ی توسعه و بهتر شدن پروژه کمک کنید.</p>
+    <p style="margin-top:10px">هر مقدار حمایتی، حتی کم، برای ما ارزشمنده و باعث میشه با انگیزه‌ی بیشتری ادامه بدیم.</p>
+    <p style="margin-top:10px">لینک حمایت مالی:</p>
+    <div style="margin-top:12px;display:flex;justify-content:center"><a href="https://reymit.ir/moditor" target="_blank" rel="noopener" class="btn btn-p" style="display:inline-flex;text-decoration:none">reymit.ir/moditor</a></div>
+    <p style="margin-top:16px;font-size:13px;color:var(--t3)">ممنون از حمایت و همراهی‌تون.</p>
     <p style="margin-top:8px;font-size:12px;color:var(--t3)">کاملاً اختیاری است و هیچ اجباری وجود ندارد.</p>
   </div>
   </div>
@@ -7312,6 +7437,14 @@ tr:hover td{background:var(--hover)}
     <div class="field"><label>نام کانفیگ / ساب</label><input id="eLabel" maxlength="60"></div>
     <div class="field"><label>تعداد کانفیگ در ساب (۱–۴۰)</label><input id="eCount" type="number" min="1" max="40" value="1"></div>
     <div class="field"><label>نام کانفیگ‌ها در ساب (هر خط یک نام، اختیاری)</label><textarea id="eNames" rows="4" placeholder="Config 1&#10;Config 2"></textarea></div>
+      <div class="field"><label>پروتکل‌های چندگانه در ساب (اختیاری)</label>
+        <p class="hint">هر ردیف یک کانفیگ جدا در ساب می‌سازد. «آدرس» همان جایی است که برنامه به آن وصل می‌شود (آی‌پی یا دامنه)؛ اگر روی یک شبکه کار نکرد، آدرس دیگری وارد کنید. خالی بماند یعنی دامنه پنل. SNI/Host را معمولاً خالی بگذارید. با داشتن ردیف، «تعداد کانفیگ» نادیده گرفته می‌شود.</p>
+        <div id="eEntries"></div>
+        <div class="entry-actions">
+          <button type="button" class="btn btn-sm" onclick="addEntryRow('eEntries')"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg><span>افزودن پروتکل</span></button>
+          <button type="button" class="btn btn-sm" onclick="addAllEntryRows('eEntries')"><span>هر ۴ نوع</span></button>
+        </div>
+      </div>
     <div class="modal-actions">
       <button class="btn" onclick="closeEdit()">لغو</button>
       <button class="btn btn-p" onclick="saveEdit()">ذخیره</button>
@@ -7517,7 +7650,7 @@ function renderLinks(arr){
     const chk=prevChecked.has(uid)?'checked':'';
     return `<tr draggable="true" data-uid="${esc(uid)}" ondragstart="cfgDragStart(event)" ondragover="cfgDragOver(event)" ondrop="cfgDrop(event)" ondragend="cfgDragEnd(event)">
       <td style="text-align:center;padding:10px 8px;vertical-align:middle"><input type="checkbox" class="cfg-chk" value="${esc(uid)}" ${chk} onchange="updateBulkBar()" style="width:16px;height:16px;margin:0;vertical-align:middle;cursor:pointer"></td>
-      <td style="cursor:grab;color:var(--t3);user-select:none" title="کشیدن">⋮⋮</td>
+      <td style="cursor:grab;color:var(--t3);user-select:none" title="کشیدن"><svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg></td>
       <td>
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
           <b>${esc(name)}</b>
@@ -7603,6 +7736,7 @@ async function doManualCreate(){
     category_id:document.getElementById('cGroup')?.value||'0',
     config_count:Math.max(1,Math.min(40,Number(document.getElementById('cCount').value)||1)),
     config_names:(document.getElementById('cNames')?.value||'').split('\n').map(s=>s.trim()).filter(Boolean),
+    entries:readEntries('cEntries'),
     limit_value:Number(document.getElementById('cLimit').value)||0,
     limit_unit:document.getElementById('cUnit').value||'GB',
     expires_days:Number(document.getElementById('cDays').value)||0,
@@ -7611,7 +7745,7 @@ async function doManualCreate(){
     speed_limit_unit:'MBIT'
   };
   const r=await api('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  if(r){showResult(r);refreshAll()}
+  if(r){showResult(r);refreshAll();loadSettings()}
 }
 async function doChangePw(){
   const cur=document.getElementById('pwCur').value,nw=document.getElementById('pwNew').value,cf=document.getElementById('pwCf').value;
@@ -7641,6 +7775,49 @@ function randomName(){
   if(/^[0-9]/.test(s)) s='a'+s.slice(1);
   document.getElementById('cName').value=s;
 }
+const ENTRY_PROTOS=[['vless-ws','VLESS WebSocket'],['xhttp-packet-up','XHTTP Packet Up'],['xhttp-stream-up','XHTTP Stream Up'],['xhttp-stream-one','XHTTP Stream One']];
+function entryRowHtml(e){
+  e=e||{};
+  const opts=ENTRY_PROTOS.map(([v,l])=>`<option value="${v}" ${e.protocol===v?'selected':''}>${l}</option>`).join('');
+  return `<div class="entry-row">
+    <select class="er-proto">${opts}</select>
+    <input class="er-addr" dir="ltr" placeholder="Address / DNS (IP or domain)" value="${esc(e.address||'')}">
+    <input class="er-sni" dir="ltr" placeholder="SNI / Host (optional)" value="${esc(e.sni||'')}">
+    <input class="er-name" placeholder="${lang==='fa'?'نام (اختیاری)':'Name (optional)'}" value="${esc(e.name||'')}" style="grid-column:1 / -1">
+    <button type="button" class="btn btn-sm btn-d er-del" onclick="this.parentElement.remove()"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></svg></button>
+  </div>`;
+}
+function addEntryRow(id,e){
+  const box=document.getElementById(id);
+  if(box.querySelectorAll('.entry-row').length>=40){toast(lang==='fa'?'حداکثر ۴۰ ردیف':'Max 40 rows');return}
+  box.insertAdjacentHTML('beforeend',entryRowHtml(e));
+}
+function addAllEntryRows(id){ENTRY_PROTOS.forEach(([v])=>addEntryRow(id,{protocol:v}))}
+function renderEntries(id,list){document.getElementById(id).innerHTML='';(list||[]).forEach(e=>addEntryRow(id,e))}
+function readEntries(id){
+  return [...document.querySelectorAll('#'+id+' .entry-row')].map(r=>({
+    protocol:r.querySelector('.er-proto').value,
+    address:r.querySelector('.er-addr').value.trim(),
+    sni:r.querySelector('.er-sni').value.trim(),
+    name:r.querySelector('.er-name').value.trim()
+  }));
+}
+async function loadSettings(){
+  try{
+    const r=await api('/api/settings');
+    if(!r)return;
+    const inp=document.getElementById('sDefaultName');
+    if(inp&&document.activeElement!==inp)inp.value=r.default_name||'';
+    const nx=document.getElementById('sDefaultNext');
+    if(nx)nx.textContent=r.next_name?((lang==='fa'?'نام بعدی: ':'Next name: ')+r.next_name):'';
+    const cn=document.getElementById('cName');
+    if(cn)cn.placeholder=r.next_name||'auto';
+  }catch(e){}
+}
+async function saveDefaultName(){
+  const r=await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({default_name:document.getElementById('sDefaultName').value})});
+  if(r){toast(lang==='fa'?'ذخیره شد':'Saved');loadSettings()}
+}
 function openEdit(uid){
   const l=(window.__linksMap||{})[uid];
   if(!l){toast(lang==='fa'?'کانفیگ پیدا نشد':'Config not found');return}
@@ -7648,6 +7825,7 @@ function openEdit(uid){
   document.getElementById('eLabel').value=l.label||l.name||'';
   document.getElementById('eCount').value=Math.max(1,Math.min(40,Number(l.config_count)||1));
   document.getElementById('eNames').value=(l.config_names||[]).join('\n');
+  renderEntries('eEntries',l.entries||[]);
   document.getElementById('editModal').classList.add('open');
 }
 function closeEdit(){document.getElementById('editModal').classList.remove('open')}
@@ -7656,7 +7834,8 @@ async function saveEdit(){
   const body={
     label:document.getElementById('eLabel').value,
     config_count:Math.max(1,Math.min(40,Number(document.getElementById('eCount').value)||1)),
-    config_names:document.getElementById('eNames').value.split('\n').map(s=>s.trim()).filter(Boolean)
+    config_names:document.getElementById('eNames').value.split('\n').map(s=>s.trim()).filter(Boolean),
+    entries:readEntries('eEntries')
   };
   const r=await api('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
   if(r){closeEdit();toast(lang==='fa'?'ذخیره شد':'Saved');refreshAll()}
@@ -7768,7 +7947,8 @@ async function loadAdmins(){
   if(!r.admins.length){box.innerHTML=`<div style="color:var(--t3);text-align:center;padding:20px">${lang==='fa'?'ادمینی نیست':'No admins'}</div>`;return}
   const labels=PERM_LABELS[lang]||PERM_LABELS.fa;
   box.innerHTML=r.admins.map(a=>{
-    const st=a.blocked?'🔴 مسدود':(a.valid?'🟢 فعال':'🟠 نامعتبر');
+    const dot=c=>`<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${c};margin-inline-end:5px"></span>`;
+    const st=a.blocked?dot('var(--red)')+'مسدود':(a.valid?dot('var(--green)')+'فعال':dot('var(--amber)')+'نامعتبر');
     const perms=Object.entries(a.permissions||{}).filter(([,v])=>v).map(([k])=>labels[k]||k).join(' · ')||'—';
     return `<div style="border:1px solid var(--card-b);border-radius:12px;padding:12px;margin-bottom:10px;background:var(--bg3)">
       <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center">
@@ -7997,7 +8177,7 @@ async function restoreBot(){
   }catch(e){ toast(e.message||String(e)); }
 }
 
-applyLang();loadMe();loadProtocols();loadGroups();refreshAll();setInterval(timerRefresh,3000);
+applyLang();loadMe();loadProtocols();loadGroups();loadSettings();refreshAll();setInterval(timerRefresh,3000);
 
 
 </script>
@@ -8116,7 +8296,7 @@ async def global_exception_handler(
             padding:40px;
         ">
             <h2>
-            خطای داخلی PX Panel
+            خطای داخلی Aurora Panel
             </h2>
 
             <p>
