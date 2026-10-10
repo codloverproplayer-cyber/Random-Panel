@@ -39,7 +39,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ============================================================
 
 APP_NAME = "PXPanel"
-APP_VERSION = "13.10.0"
+APP_VERSION = "13.11.0"
 
 SUPPORT_USERNAME = "@logic_sec"
 SUPPORT_URL = "https://t.me/logic_sec"
@@ -1342,7 +1342,7 @@ async def save_state():
                     json.dumps(
                         payload,
                         ensure_ascii=False,
-                        indent=2,
+                        separators=(",", ":"),
                     )
                 )
 
@@ -1356,6 +1356,89 @@ async def save_state():
                 "Could not save state: %s",
                 exc,
             )
+
+
+# ============================================================
+# HEALTH / BACKUP / RESTORE
+# ============================================================
+
+@app.get("/api/backup")
+async def backup_state(_=Depends(require_auth)):
+    """Download links, subscription groups and categories as JSON.
+
+    Admin passwords are intentionally NOT included.
+    """
+    async with LINKS_LOCK:
+        links = json.loads(json.dumps(LINKS, ensure_ascii=False))
+    async with SUBS_LOCK:
+        subs = json.loads(json.dumps(SUBS, ensure_ascii=False))
+    payload = {
+        "format": "pxpanel-backup",
+        "version": APP_VERSION,
+        "created_at": datetime.now().isoformat(),
+        "links": links,
+        "subs": subs,
+        "categories": json.loads(json.dumps(CATEGORIES, ensure_ascii=False)),
+    }
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return Response(
+        content=json.dumps(payload, ensure_ascii=False, indent=2),
+        media_type="application/json; charset=utf-8",
+        headers={"content-disposition": f'attachment; filename="pxpanel-backup-{stamp}.json"'},
+    )
+
+
+@app.post("/api/restore")
+async def restore_state(request: Request, _=Depends(require_auth)):
+    """Merge a backup into the panel (existing items with the same id are overwritten).
+
+    Nothing is deleted. A copy of the current state file is kept as *.before-restore.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="JSON نامعتبر")
+    if not isinstance(body, dict) or not isinstance(body.get("links"), dict):
+        raise HTTPException(status_code=400, detail="فایل بکاپ معتبر نیست")
+    links = body.get("links") or {}
+    subs = body.get("subs") or {}
+    cats = body.get("categories") or {}
+    if not (isinstance(subs, dict) and isinstance(cats, dict)):
+        raise HTTPException(status_code=400, detail="فایل بکاپ معتبر نیست")
+    if len(links) > 20000:
+        raise HTTPException(status_code=400, detail="بکاپ بیش از حد بزرگ است")
+    bad = [k for k, v in links.items() if not isinstance(v, dict) or not isinstance(k, str) or len(k) > 64]
+    if bad:
+        raise HTTPException(status_code=400, detail="رکورد نامعتبر در بکاپ")
+
+    try:
+        if DATA_FILE.exists():
+            DATA_FILE.with_suffix(".before-restore").write_bytes(DATA_FILE.read_bytes())
+    except Exception as exc:
+        logger.warning("Could not keep pre-restore copy: %s", exc)
+
+    async with LINKS_LOCK:
+        for uid, link in links.items():
+            link.setdefault("protocol", DEFAULT_PROTOCOL)
+            link.setdefault("fingerprint", DEFAULT_FINGERPRINT)
+            link.setdefault("alpn", "")
+            link.setdefault("port", DEFAULT_PORT)
+            link.setdefault("used_bytes", 0)
+            link.setdefault("clean_ips", [])
+            link.setdefault("category_id", "0")
+            link.setdefault("config_count", 1)
+            link.setdefault("usage_history", [])
+            LINKS[uid] = link
+    async with SUBS_LOCK:
+        for sid, sub in subs.items():
+            if isinstance(sub, dict):
+                SUBS[sid] = sub
+    for cid, cat in cats.items():
+        if isinstance(cat, dict):
+            CATEGORIES[cid] = cat
+    await save_state()
+    log_activity("system", f"Backup restored: {len(links)} links", "ok")
+    return {"ok": True, "links": len(links), "subs": len(subs), "categories": len(cats)}
 
 
 # ============================================================
@@ -2020,12 +2103,12 @@ body{
     background:
         radial-gradient(
             circle at 15% 15%,
-            rgba(37,99,235,.22),
+            rgba(13,148,136,.22),
             transparent 30%
         ),
         radial-gradient(
             circle at 85% 85%,
-            rgba(59,130,246,.18),
+            rgba(20,184,166,.18),
             transparent 30%
         ),
         #07070a;
@@ -2073,8 +2156,8 @@ body{
     background:
         linear-gradient(
             135deg,
-            #2563eb,
-            #3b82f6
+            #0d9488,
+            #14b8a6
         );
 }
 
@@ -2086,7 +2169,7 @@ body{
 .version{
     margin-top:4px;
     font-size:11px;
-    color:#60a5fa;
+    color:#5eead4;
 }
 
 .status{
@@ -2151,8 +2234,8 @@ h1{
     background:
         linear-gradient(
             135deg,
-            #2563eb,
-            #3b82f6
+            #0d9488,
+            #14b8a6
         );
 }
 
@@ -2175,7 +2258,7 @@ h1{
 }
 
 .support{
-    color:#60a5fa;
+    color:#5eead4;
     text-decoration:none;
 }
 
@@ -2386,10 +2469,10 @@ input{
   background:rgba(0,0,0,.35);color:#fff;font-family:inherit;font-size:14px;outline:none;margin-bottom:14px;
   direction:ltr;text-align:left;
 }
-input:focus{border-color:rgba(59,130,246,.55)}
+input:focus{border-color:rgba(20,184,166,.55)}
 button{
   width:100%;padding:13px;border:none;border-radius:12px;
-  background:#2563eb;color:#fff;font-family:inherit;font-size:14px;font-weight:700;cursor:pointer;margin-top:4px;
+  background:#0d9488;color:#fff;font-family:inherit;font-size:14px;font-weight:700;cursor:pointer;margin-top:4px;
 }
 button:hover{background:#1d4ed8}
 button:disabled{opacity:.5;cursor:not-allowed}
@@ -3396,6 +3479,11 @@ async def update_link(
                 body.get("config_names")
             )
 
+        if "config_count" in body:
+            link["config_count"] = safe_int(
+                body.get("config_count", 1), minimum=1, maximum=40
+            )
+
         if "note" in body:
 
             link["note"] = str(
@@ -4052,6 +4140,11 @@ async def info_page(
     fingerprint_escaped = escape_html(snapshot.get("fingerprint", "chrome"))
     vless_url_escaped = escape_html(vless_url)
     sub_url_escaped = escape_html(sub_url)
+    _sub_q = quote(sub_url, safe="")
+    _name_q = quote(str(snapshot.get("label") or "PXPanel"), safe="")
+    deeplink_v2rayng = escape_html(f"v2rayng://install-sub?url={_sub_q}&name={_name_q}")
+    deeplink_hiddify = escape_html(f"hiddify://import/{sub_url}#{_name_q}")
+    deeplink_streisand = escape_html(f"streisand://import/{sub_url}")
     dash_calc_offset = f"{339.29 - (339.29 * min(usage_percent, 100) / 100):.1f}"
 
     info_html = f"""<!DOCTYPE html>
@@ -4063,42 +4156,48 @@ async def info_page(
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+<link rel="preconnect" href="https://cdn.tailwindcss.com" crossorigin>
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
 <script src="https://cdn.tailwindcss.com"></script>
-<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js" defer></script>
 <script>
   tailwind.config = {{
     theme: {{
       extend: {{
-        fontFamily: {{ vazir: ['Vazirmatn','system-ui','sans-serif'] }}
+        fontFamily: {{ vazir: ['Vazirmatn','system-ui','sans-serif'] }},
+        colors: {{
+          blue: {{50:'#f0fdfa',100:'#ccfbf1',200:'#99f6e4',300:'#5eead4',400:'#2dd4bf',500:'#14b8a6',600:'#0d9488',700:'#0f766e',800:'#115e59',900:'#134e4a'}},
+          purple: {{50:'#f5f3ff',100:'#ede9fe',200:'#ddd6fe',300:'#c4b5fd',400:'#a78bfa',500:'#8b5cf6',600:'#7c3aed',700:'#6d28d9',800:'#5b21b6',900:'#4c1d95'}}
+        }}
       }}
     }}
   }}
 </script>
 <style>
   :root {{
-    --bg-main: #05060a;
+    --bg-main: #050b14;
     --bg-card: rgba(255, 255, 255, 0.04);
     --bg-card-hover: rgba(255, 255, 255, 0.07);
     --border-color: rgba(255, 255, 255, 0.1);
     --text-main: #f1f5f9;
     --text-muted: rgba(255, 255, 255, 0.4);
     --bg-sub-card: rgba(0, 0, 0, 0.2);
-    --grad-1: rgba(96,165,250,.16);
-    --grad-2: rgba(96,165,250,.13);
-    --grad-3: rgba(52,211,153,.08);
+    --grad-1: rgba(45,212,191,.20);
+    --grad-2: rgba(139,92,246,.16);
+    --grad-3: rgba(74,222,128,.11);
   }}
 
   body.theme-lighter {{
-    --bg-main: #131722;
+    --bg-main: #0d1a2b;
     --bg-card: rgba(255, 255, 255, 0.075);
     --bg-card-hover: rgba(255, 255, 255, 0.115);
     --border-color: rgba(255, 255, 255, 0.16);
     --text-main: #ffffff;
     --text-muted: rgba(255, 255, 255, 0.6);
     --bg-sub-card: rgba(0, 0, 0, 0.35);
-    --grad-1: rgba(96,165,250,.24);
-    --grad-2: rgba(96,165,250,.20);
-    --grad-3: rgba(52,211,153,.13);
+    --grad-1: rgba(45,212,191,.26);
+    --grad-2: rgba(139,92,246,.20);
+    --grad-3: rgba(74,222,128,.15);
   }}
 
   html,body{{background:var(--bg-main); transition: background 0.3s ease, color 0.3s ease;}}
@@ -4126,6 +4225,24 @@ async def info_page(
   .sub-box {{
     background-color: var(--bg-sub-card);
   }}
+  /* Aurora accents */
+  .aurora-card {{ position: relative; overflow: hidden; }}
+  .aurora-card::before {{
+    content: ''; position: absolute; inset: 0 0 auto 0; height: 2px;
+    background: linear-gradient(90deg, #0d9488, #2dd4bf, #4ade80, #8b5cf6, #d946ef, #0d9488);
+    background-size: 200% 100%; animation: auroraSlide 8s linear infinite;
+  }}
+  @keyframes auroraSlide {{ to {{ background-position: 200% 0; }} }}
+  .qc-btn {{
+    display: flex; align-items: center; justify-content: center; gap: 6px;
+    padding: 12px 10px; border-radius: 14px; font-size: 12px; font-weight: 800; color: #fff;
+    background: linear-gradient(135deg, #0d9488, #7c3aed); border: 0; cursor: pointer;
+    text-decoration: none; transition: transform .15s, filter .15s; -webkit-tap-highlight-color: transparent;
+  }}
+  .qc-btn:hover {{ filter: brightness(1.1); }}
+  .qc-btn:active {{ transform: scale(.97); }}
+  .qc-btn.alt {{ background: rgba(255,255,255,.07); border: 1px solid rgba(255,255,255,.14); }}
+  @media (prefers-reduced-motion: reduce) {{ .aurora-card::before {{ animation: none; }} }}
 </style>
 </head>
 <body class="font-vazir text-slate-100 antialiased min-h-screen py-8 px-3 sm:px-4 md:py-14">
@@ -4141,7 +4258,7 @@ async def info_page(
   </div>
 
   <!-- Hero -->
-  <section class="rounded-[26px] sm:rounded-[28px] border dynamic-card backdrop-blur-2xl p-5 sm:p-6 md:p-8">
+  <section class="aurora-card rounded-[26px] sm:rounded-[28px] border dynamic-card backdrop-blur-2xl p-5 sm:p-6 md:p-8">
     <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-5">
       <div class="flex items-center gap-4">
         <div class="w-13 h-13 sm:w-14 sm:h-14 shrink-0 rounded-2xl grid place-items-center bg-gradient-to-br from-blue-400/20 to-purple-400/10 border border-blue-400/25 text-blue-300">
@@ -4165,6 +4282,18 @@ async def info_page(
     </div>
   </section>
 
+  <!-- Quick connect -->
+  <section class="rounded-[22px] border dynamic-card backdrop-blur-2xl p-5 sm:p-6">
+    <p class="text-sm font-black">اتصال سریع</p>
+    <p class="mt-1 text-[11px] text-white/45">برنامه را نصب کرده‌اید؟ با یک لمس، ساب به برنامه اضافه می‌شود.</p>
+    <div class="mt-4 grid grid-cols-2 sm:grid-cols-4 gap-3">
+      <a class="qc-btn" href="{deeplink_v2rayng}">v2rayNG</a>
+      <a class="qc-btn" href="{deeplink_hiddify}">Hiddify</a>
+      <a class="qc-btn" href="{deeplink_streisand}">Streisand</a>
+      <button id="subCopyTop" type="button" class="qc-btn alt" onclick="pxCopy('subLinkText','subCopyTop')"><span>کپی لینک ساب</span></button>
+    </div>
+  </section>
+
   <!-- Usage overview -->
   <section class="grid grid-cols-1 lg:grid-cols-[1.6fr_1fr] gap-5 sm:gap-6">
 
@@ -4185,8 +4314,8 @@ async def info_page(
               stroke-dasharray="339.29" stroke-dashoffset="{dash_calc_offset}"/>
             <defs>
               <linearGradient id="usageRingGradient" x1="0%" y1="0%" x2="100%" y2="100%">
-                <stop offset="0%" stop-color="#34d399"/>
-                <stop offset="100%" stop-color="#f59e0b"/>
+                <stop offset="0%" stop-color="#2dd4bf"/>
+                <stop offset="100%" stop-color="#a78bfa"/>
               </linearGradient>
             </defs>
           </svg>
@@ -4212,12 +4341,12 @@ async def info_page(
             <svg viewBox="0 0 300 64" class="w-full h-14" preserveAspectRatio="none">
               <defs>
                 <linearGradient id="trendFill" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stop-color="#60a5fa" stop-opacity="0.35"/>
-                  <stop offset="100%" stop-color="#60a5fa" stop-opacity="0"/>
+                  <stop offset="0%" stop-color="#5eead4" stop-opacity="0.35"/>
+                  <stop offset="100%" stop-color="#5eead4" stop-opacity="0"/>
                 </linearGradient>
               </defs>
               <path d="M0,64 L{svg_points} L300,64 Z" fill="url(#trendFill)"/>
-              <path d="M{svg_points}" fill="none" stroke="#60a5fa" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M{svg_points}" fill="none" stroke="#5eead4" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
             </svg>
           </div>
 
@@ -4429,6 +4558,14 @@ async def info_page(
     پشتیبانی و اطلاعیه‌ها &nbsp;·&nbsp; <b class="text-emerald-300">کانال تلگرام: logic_sec</b>
   </div>
 
+</div>
+
+<div class="h-20 sm:hidden"></div>
+<div class="fixed bottom-0 inset-x-0 z-40 sm:hidden px-3" style="padding-bottom:max(12px,env(safe-area-inset-bottom))">
+  <div class="flex gap-2 rounded-2xl border border-white/10 p-2 backdrop-blur-xl" style="background:rgba(5,11,20,.85)">
+    <button id="subCopyBar" type="button" class="qc-btn flex-1" onclick="pxCopy('subLinkText','subCopyBar')"><span>کپی لینک ساب</span></button>
+    <button type="button" class="qc-btn alt" onclick="openQrModal()" style="min-width:64px">QR</button>
+  </div>
 </div>
 
 <!-- QR Code Modal Popup -->
@@ -5010,7 +5147,7 @@ body{
     background:
         radial-gradient(
             circle at top right,
-            rgba(37,99,235,.17),
+            rgba(13,148,136,.17),
             transparent 30%
         ),
         #07070a;
@@ -5062,12 +5199,12 @@ h1{
     display:inline-block;
     margin-top:18px;
 
-    color:#60a5fa;
+    color:#5eead4;
     text-decoration:none;
 }
 
 .version{
-    color:#60a5fa;
+    color:#5eead4;
     font-size:11px;
 }
 
@@ -6489,38 +6626,44 @@ DASHBOARD_HTML = r"""
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-<title>PXPanel 13.8.0</title>
+<title>PXPanel</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 :root{
-  --bg:#06060b;--bg2:#0b0b12;--bg3:#12121c;--card:rgba(18,18,28,.92);--card-b:rgba(255,255,255,.08);
-  --accent:#3b82f6;--accent2:#60a5fa;--purple:#8b5cf6;--green:#22c55e;--red:#ef4444;--amber:#f59e0b;
-  --t1:#f8fafc;--t2:rgba(248,250,252,.72);--t3:rgba(248,250,252,.42);
+  --bg:#050b14;--bg2:#09131f;--bg3:#0f1c2d;--card:rgba(11,24,40,.86);--card-b:rgba(148,226,213,.10);
+  --accent:#14b8a6;--accent2:#5eead4;--purple:#a78bfa;--green:#4ade80;--red:#f87171;--amber:#fbbf24;--pink:#f0abfc;
+  --aurora:linear-gradient(135deg,#0d9488 0%,#2dd4bf 35%,#8b5cf6 75%,#d946ef 100%);
+  --t1:#f1f8fb;--t2:rgba(226,244,248,.74);--t3:rgba(226,244,248,.44);
   --sb:252px;--sb-c:74px;--radius:18px;--shadow:0 12px 40px rgba(0,0,0,.45);
-  --input-bg:rgba(0,0,0,.4);--hover:rgba(59,130,246,.12);
-  --glow:0 0 40px rgba(59,130,246,.12);--glass:blur(16px);
+  --input-bg:rgba(2,10,20,.5);--hover:rgba(20,184,166,.13);
+  --glow:0 0 40px rgba(20,184,166,.12);--glass:blur(16px);
 }
 html.light{
-  --bg:#eef1f8;--bg2:#ffffff;--bg3:#f1f4fa;--card:#ffffff;--card-b:rgba(15,23,42,.09);
-  --accent:#2563eb;--accent2:#3b82f6;--purple:#7c3aed;--green:#16a34a;--red:#dc2626;--amber:#d97706;
+  --bg:#ecf8f6;--bg2:#ffffff;--bg3:#f0faf8;--card:#ffffff;--card-b:rgba(13,80,90,.10);
+  --accent:#0d9488;--accent2:#0f766e;--purple:#7c3aed;--green:#16a34a;--red:#dc2626;--amber:#d97706;--pink:#c026d3;
   --t1:#0f172a;--t2:#475569;--t3:#94a3b8;
   --shadow:0 10px 32px rgba(15,23,42,.08);
-  --input-bg:#f8fafc;--hover:rgba(37,99,235,.08);
-  --glow:0 0 32px rgba(37,99,235,.08);--glass:blur(12px);
+  --input-bg:#f8fafc;--hover:rgba(13,148,136,.08);
+  --glow:0 0 32px rgba(13,148,136,.08);--glass:blur(12px);
 }
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{min-height:100%}
 body{font-family:'Vazirmatn',sans-serif;background:var(--bg);color:var(--t1);display:flex;min-height:100vh;overflow-x:hidden;transition:background .3s,color .3s}
-body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:0;
+body::before{content:'';position:fixed;inset:-20%;pointer-events:none;z-index:0;
   background:
-    radial-gradient(ellipse 80% 50% at 100% 0%, rgba(59,130,246,.14), transparent 50%),
-    radial-gradient(ellipse 60% 40% at 0% 100%, rgba(139,92,246,.10), transparent 45%);
-}
+    radial-gradient(ellipse 55% 40% at 85% 5%, rgba(45,212,191,.20), transparent 60%),
+    radial-gradient(ellipse 50% 40% at 10% 15%, rgba(139,92,246,.16), transparent 60%),
+    radial-gradient(ellipse 60% 35% at 55% 105%, rgba(74,222,128,.12), transparent 60%),
+    radial-gradient(ellipse 35% 30% at 95% 85%, rgba(217,70,239,.10), transparent 60%);
+  animation:auroraDrift 26s ease-in-out infinite alternate;will-change:transform}
+@keyframes auroraDrift{0%{transform:translate3d(0,0,0) scale(1)}50%{transform:translate3d(-2%,1.5%,0) scale(1.05)}100%{transform:translate3d(2%,-1.5%,0) scale(1.02)}}
+@media (prefers-reduced-motion:reduce){body::before{animation:none}}
 html.light body::before{
   background:
-    radial-gradient(ellipse 80% 50% at 100% 0%, rgba(37,99,235,.08), transparent 50%),
-    radial-gradient(ellipse 60% 40% at 0% 100%, rgba(124,58,237,.06), transparent 45%);
+    radial-gradient(ellipse 55% 40% at 85% 5%, rgba(45,212,191,.22), transparent 60%),
+    radial-gradient(ellipse 50% 40% at 10% 15%, rgba(167,139,250,.16), transparent 60%),
+    radial-gradient(ellipse 60% 35% at 55% 105%, rgba(74,222,128,.14), transparent 60%);
 }
 .sidebar,.main,.mob-bar,.modal-bg,.toast{position:relative;z-index:1}
 .sidebar{z-index:300}.mob-bar{z-index:250}.modal-bg{z-index:500}.toast{z-index:999}
@@ -6530,12 +6673,12 @@ body.en{font-family:'Inter',system-ui,sans-serif}
 
 .sidebar{position:fixed;right:0;top:0;bottom:0;width:var(--sb);background:var(--bg2);border-left:1px solid var(--card-b);display:flex;flex-direction:column;z-index:300;transition:width .28s cubic-bezier(.4,0,.2,1),transform .28s,background .3s;box-shadow:var(--shadow);backdrop-filter:var(--glass)}
 .sidebar.collapsed{width:var(--sb-c)}
-.sb-toggle{position:absolute;left:-15px;top:50%;transform:translateY(-50%);width:30px;height:30px;border-radius:8px;background:var(--accent);border:2px solid var(--bg);color:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:310;box-shadow:0 4px 14px rgba(37,99,235,.4);transition:.2s}
+.sb-toggle{position:absolute;left:-15px;top:50%;transform:translateY(-50%);width:30px;height:30px;border-radius:8px;background:var(--accent);border:2px solid var(--bg);color:#fff;display:flex;align-items:center;justify-content:center;cursor:pointer;z-index:310;box-shadow:0 4px 14px rgba(13,148,136,.4);transition:.2s}
 .sb-toggle:hover{filter:brightness(1.1);transform:translateY(-50%) scale(1.05)}
 .sb-toggle svg{width:14px;height:14px;transition:transform .28s}
 .sidebar.collapsed .sb-toggle svg{transform:rotate(180deg)}
 .sb-logo{display:flex;align-items:center;gap:12px;padding:20px 16px;border-bottom:1px solid var(--card-b)}
-.sb-logo-icon{width:40px;height:40px;border-radius:12px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:13px;color:#fff;flex-shrink:0;box-shadow:0 4px 14px rgba(59,130,246,.35)}
+.sb-logo-icon{width:40px;height:40px;border-radius:12px;background:var(--aurora);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:13px;color:#fff;flex-shrink:0;box-shadow:0 4px 14px rgba(20,184,166,.35)}
 .sb-logo-text{overflow:hidden;white-space:nowrap}
 .sb-logo-name{font-size:15px;font-weight:800;letter-spacing:-.02em}
 .sb-logo-ver{font-size:10px;color:var(--t3);margin-top:2px}
@@ -6573,7 +6716,7 @@ body.en{font-family:'Inter',system-ui,sans-serif}
 
 .metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:20px}
 .metric{background:var(--card);border:1px solid var(--card-b);border-radius:var(--radius);padding:18px;box-shadow:var(--shadow);transition:.25s;backdrop-filter:var(--glass)}
-.metric:hover{border-color:rgba(59,130,246,.25)}
+.metric:hover{border-color:rgba(20,184,166,.25)}
 .metric-label{font-size:11px;color:var(--t3);margin-bottom:8px;display:flex;align-items:center;gap:6px;font-weight:600}
 .metric-val{font-size:24px;font-weight:800;letter-spacing:-.03em}
 .card{background:var(--card);border:1px solid var(--card-b);border-radius:var(--radius);padding:20px;margin-bottom:14px;box-shadow:var(--shadow);backdrop-filter:var(--glass);transition:border-color .2s,box-shadow .2s}
@@ -6581,12 +6724,12 @@ body.en{font-family:'Inter',system-ui,sans-serif}
 .card-title svg{width:16px;height:16px;color:var(--accent2)}
 .g2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
 .action-card{cursor:pointer;transition:.2s;border:1px solid var(--card-b)}
-.action-card:hover{border-color:rgba(59,130,246,.4);transform:translateY(-2px);box-shadow:0 12px 28px rgba(59,130,246,.12)}
+.action-card:hover{border-color:rgba(20,184,166,.4);transform:translateY(-2px);box-shadow:0 12px 28px rgba(20,184,166,.12)}
 .action-card.purple:hover{border-color:rgba(139,92,246,.45)}
 
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;padding:10px 16px;border-radius:11px;border:1px solid var(--card-b);background:var(--bg3);color:var(--t2);cursor:pointer;font-family:inherit;font-size:12px;font-weight:600;transition:.15s}
 .btn:hover{color:var(--t1);border-color:var(--accent)}
-.btn-p{background:linear-gradient(135deg,#3b82f6,#6366f1);border:none;color:#fff;box-shadow:0 6px 20px rgba(59,130,246,.35)}
+.btn-p{background:linear-gradient(135deg,#0d9488,#7c3aed);border:none;color:#fff;box-shadow:0 6px 20px rgba(20,184,166,.30)}
 .btn-p:hover{filter:brightness(1.08);color:#fff}
 .btn-d{background:rgba(239,68,68,.1);border-color:rgba(239,68,68,.25);color:var(--red)}
 .btn-sm{padding:7px 11px;font-size:11px;border-radius:9px}
@@ -6601,17 +6744,17 @@ tr:hover td{background:var(--hover)}
 
 .range-tabs{display:flex;gap:4px;background:var(--bg3);padding:4px;border-radius:12px;border:1px solid var(--card-b)}
 .range-tab{padding:7px 13px;border-radius:9px;font-size:11px;font-weight:700;color:var(--t3);cursor:pointer;border:none;background:transparent;font-family:inherit;transition:.15s}
-.range-tab.on{background:var(--accent);color:#fff;box-shadow:0 2px 8px rgba(37,99,235,.35)}
+.range-tab.on{background:var(--accent);color:#fff;box-shadow:0 2px 8px rgba(13,148,136,.35)}
 
 .field{margin-bottom:14px}
 .field label{display:block;font-size:11px;color:var(--t3);margin-bottom:6px;font-weight:700}
 .field input,.field select,.field textarea{width:100%;padding:11px 13px;border-radius:11px;border:1px solid var(--card-b);background:var(--input-bg);color:var(--t1);font-family:inherit;font-size:13px;outline:none;transition:.15s}
-.field input:focus,.field select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(59,130,246,.15)}
+.field input:focus,.field select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(20,184,166,.15)}
 .form-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 
 .support-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}
 .support-tile{display:flex;align-items:center;gap:14px;padding:20px;background:var(--card);border:1px solid var(--card-b);border-radius:var(--radius);text-decoration:none;color:inherit;transition:.2s;box-shadow:var(--shadow)}
-.support-tile:hover{border-color:rgba(59,130,246,.35);transform:translateY(-3px)}
+.support-tile:hover{border-color:rgba(20,184,166,.35);transform:translateY(-3px)}
 .support-icon{width:48px;height:48px;border-radius:14px;background:var(--hover);display:flex;align-items:center;justify-content:center;flex-shrink:0}
 .support-icon svg{width:22px;height:22px;color:var(--accent2)}
 .support-label{font-size:11px;color:var(--t3);font-weight:600}
@@ -6858,7 +7001,7 @@ tr:hover td{background:var(--hover)}
       <p style="color:var(--t2);font-size:13px;line-height:1.75;margin-bottom:14px" data-i18n="auto_desc">با یک کلیک کانفیگ بهینه ساخته می‌شود. بعد از ساخت لینک VLESS و ساب در اختیار شماست.</p>
       <div class="field"><label data-i18n="label_proto">پروتکـل</label><select id="aProto"></select></div>
       <div class="field"><label data-i18n="label_count">تعداد کانفیگ در سـاب (1-40)</label><input id="aCount" type="number" value="1" min="1" max="40"></div>
-      <button class="btn btn-p" style="width:100%;background:linear-gradient(135deg,#8b5cf6,#6366f1)" onclick="doAutoCreate()">
+      <button class="btn btn-p" style="width:100%;background:linear-gradient(135deg,#8b5cf6,#8b5cf6)" onclick="doAutoCreate()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><circle cx="12" cy="12" r="3"/><path d="M12 2v2M12 20v2"/></svg>
         <span data-i18n="btn_auto">ساخـت خودکــار</span>
       </button>
@@ -6941,6 +7084,15 @@ tr:hover td{background:var(--hover)}
   </div>
   
   <div class="card">
+    <div class="card-title">بکاپ و بازیابی</div>
+    <p style="font-size:12px;color:var(--t3);line-height:1.8;margin-bottom:12px">کانفیگ‌ها، گروه‌ها و دسته‌ها را دانلود کنید. رمز عبور در بکاپ ذخیره نمی‌شود. بازیابی فقط ادغام می‌کند و چیزی را حذف نمی‌کند.</p>
+    <div style="display:flex;gap:10px;flex-wrap:wrap">
+      <button class="btn btn-p" onclick="downloadBackup()">دانلود بکاپ</button>
+      <label class="btn" style="cursor:pointer">بازیابی از فایل<input type="file" accept="application/json,.json" style="display:none" onchange="restoreBackup(this)"></label>
+    </div>
+  </div>
+
+  <div class="card">
     <div class="card-title">امنیت بیشتـر</div>
     <p style="font-size:12px;color:var(--t3);line-height:1.8;margin-bottom:12px">پـس از 5 تـلاش ناموفـق، ایپـی به مدت 30 دقیقه مسدود می‌شود.</p>
     <div id="secStatus" style="font-size:12px;color:var(--t2);margin-bottom:10px">—</div>
@@ -6952,7 +7104,7 @@ tr:hover td{background:var(--hover)}
     <p style="font-size:12px;color:var(--t3);line-height:1.8;margin-bottom:14px">در صورت خرابی پنل، بک‌آپ را دانلود کنید و در پنل جدید وارد کنید.</p>
     <div class="g2" style="margin-bottom:12px">
       <button class="btn btn-p" style="width:100%" onclick="downloadBackup('users')">دانلود بک‌آپ کاربران</button>
-      <button class="btn btn-p" style="width:100%;background:linear-gradient(135deg,#8b5cf6,#6366f1)" onclick="downloadBackup('bot')">دانلود بک‌آپ ربات</button>
+      <button class="btn btn-p" style="width:100%;background:linear-gradient(135deg,#8b5cf6,#8b5cf6)" onclick="downloadBackup('bot')">دانلود بک‌آپ ربات</button>
     </div>
     <div class="field">
       <label>وارد کردن بـک‌آپ کاربران</label>
@@ -7116,6 +7268,20 @@ tr:hover td{background:var(--hover)}
   </div>
 </div>
 
+<div class="modal-bg" id="editModal">
+  <div class="modal">
+    <div class="modal-title">ویرایش کانفیگ</div>
+    <input type="hidden" id="eUid">
+    <div class="field"><label>نام کانفیگ / ساب</label><input id="eLabel" maxlength="60"></div>
+    <div class="field"><label>تعداد کانفیگ در ساب (۱–۴۰)</label><input id="eCount" type="number" min="1" max="40" value="1"></div>
+    <div class="field"><label>نام کانفیگ‌ها در ساب (هر خط یک نام، اختیاری)</label><textarea id="eNames" rows="4" placeholder="Config 1&#10;Config 2"></textarea></div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeEdit()">لغو</button>
+      <button class="btn btn-p" onclick="saveEdit()">ذخیره</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal-bg" id="panelModal">
   <div class="modal">
     <div class="modal-title" id="panelModalTitle">...</div>
@@ -7194,8 +7360,17 @@ async function api(url,opts={}){
 function fmtB(b){b=Number(b)||0;if(b<1024)return b+' B';if(b<1024**2)return (b/1024).toFixed(1)+' KB';if(b<1024**3)return (b/1024**2).toFixed(2)+' MB';return (b/1024**3).toFixed(2)+' GB'}
 function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
 
+let __refreshBusy=false,__refreshTick=0,__timerCall=false;
 async function refreshAll(){
-  if(typeof loadGroups==='function') try{await loadGroups()}catch(e){}
+  if(__refreshBusy)return;
+  const fromTimer=__timerCall;__timerCall=false;
+  __refreshBusy=true;
+  try{await _refreshAllInner(fromTimer)}finally{__refreshBusy=false}
+}
+function timerRefresh(){if(document.hidden)return;__timerCall=true;refreshAll()}
+async function _refreshAllInner(fromTimer){
+  // groups rarely change: reload them on every 5th timer tick, but always after a manual action
+  if(typeof loadGroups==='function' && (!fromTimer || (__refreshTick++%5===0))) try{await loadGroups()}catch(e){}
   const links=await api('/api/links');
   if(!links)return;
   const arr=Array.isArray(links.links)?links.links:(Array.isArray(links)?links:[]);
@@ -7320,6 +7495,7 @@ function renderLinks(arr){
         <button class="btn btn-sm" onclick="copyLinkById('${esc(uid)}')" title="VLESS"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
         <button class="btn btn-sm" onclick="copySubById('${esc(uid)}')" title="Sub"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 11a9 9 0 0 1 9 9M4 4a16 16 0 0 1 16 16"/><circle cx="5" cy="19" r="1"/></svg></button>
         <a class="btn btn-sm" href="/info/${esc(uid)}" target="_blank" title="INFO" style="text-decoration:none"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg></a>
+        <button class="btn btn-sm" onclick="openEdit('${esc(uid)}')" title="Edit"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg></button>
         <button class="btn btn-sm" onclick="resetUsage('${esc(uid)}')" title="Reset"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg></button>
         <button class="btn btn-sm btn-d" onclick="deleteLink('${esc(uid)}')"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></svg></button>
       </td>
@@ -7428,18 +7604,49 @@ function randomName(){
   if(/^[0-9]/.test(s)) s='a'+s.slice(1);
   document.getElementById('cName').value=s;
 }
+function openEdit(uid){
+  const l=(window.__linksMap||{})[uid];
+  if(!l){toast(lang==='fa'?'کانفیگ پیدا نشد':'Config not found');return}
+  document.getElementById('eUid').value=uid;
+  document.getElementById('eLabel').value=l.label||l.name||'';
+  document.getElementById('eCount').value=Math.max(1,Math.min(40,Number(l.config_count)||1));
+  document.getElementById('eNames').value=(l.config_names||[]).join('\n');
+  document.getElementById('editModal').classList.add('open');
+}
+function closeEdit(){document.getElementById('editModal').classList.remove('open')}
+async function saveEdit(){
+  const uid=document.getElementById('eUid').value;
+  const body={
+    label:document.getElementById('eLabel').value,
+    config_count:Math.max(1,Math.min(40,Number(document.getElementById('eCount').value)||1)),
+    config_names:document.getElementById('eNames').value.split('\n').map(s=>s.trim()).filter(Boolean)
+  };
+  const r=await api('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  if(r){closeEdit();toast(lang==='fa'?'ذخیره شد':'Saved');refreshAll()}
+}
+document.getElementById('editModal').addEventListener('click',e=>{if(e.target.id==='editModal')closeEdit()});
+function downloadBackup(){window.location.href='/api/backup'}
+async function restoreBackup(input){
+  const f=input.files&&input.files[0];
+  if(!f)return;
+  let data;
+  try{data=JSON.parse(await f.text())}catch(e){toast(lang==='fa'?'فایل بکاپ معتبر نیست':'Invalid backup file');input.value='';return}
+  if(!confirm(lang==='fa'?'بکاپ با اطلاعات فعلی ادغام می‌شود (چیزی حذف نمی‌شود). ادامه؟':'The backup will be merged into the current data (nothing is deleted). Continue?')){input.value='';return}
+  const r=await api('/api/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+  input.value='';
+  if(r){toast((lang==='fa'?'بازیابی شد: ':'Restored: ')+(r.links||0));refreshAll()}
+}
 async function panelUpdate(){
   const m=document.getElementById('panelModal');
   const t=document.getElementById('panelModalTitle');
   const b=document.getElementById('panelModalBody');
-  t.textContent=lang==='fa'?'در حال بررسی آپدیت...':'Checking update...';
-  b.innerHTML='<div style="text-align:center;padding:20px"><div class="spin"></div></div>';
-  m.classList.add('open');
-  await new Promise(r=>setTimeout(r,1400));
-  t.textContent=lang==='fa'?'آپدیت پنل':'Panel update';
+  t.textContent=lang==='fa'?'نسخه پنل':'Panel version';
+  let ver='';
+  try{const h=await (await fetch('/health')).json();ver=h.version||''}catch(e){}
   b.innerHTML=(lang==='fa'
-    ?'<p style="margin-bottom:12px">اپدیت با خطا مواجه شد. اپدیت را دستی انجام دهید.</p><a href="https://github.com/iran-px-panel/pxpanel" target="_blank" rel="noopener" style="color:var(--accent2);font-weight:700">github.com/iran-px-panel/pxpanel</a>'
-    :'<p style="margin-bottom:12px">Update failed. Please update manually.</p><a href="https://github.com/iran-px-panel/pxpanel" target="_blank" rel="noopener" style="color:var(--accent2);font-weight:700">github.com/iran-px-panel/pxpanel</a>');
+    ?'<p style="margin-bottom:8px">نسخه فعلی: <b>'+esc(ver||'—')+'</b></p><p style="margin-bottom:12px">برای آپدیت، تغییرات را در GitHub ذخیره (commit) کنید؛ Railway خودکار دوباره دیپلوی می‌کند.</p>'
+    :'<p style="margin-bottom:8px">Current version: <b>'+esc(ver||'—')+'</b></p><p style="margin-bottom:12px">To update, commit your changes to GitHub; Railway redeploys automatically.</p>');
+  m.classList.add('open');
 }
 async function saveTelegram(){
   const token=document.getElementById('tgToken').value.trim();
@@ -7753,7 +7960,7 @@ async function restoreBot(){
   }catch(e){ toast(e.message||String(e)); }
 }
 
-applyLang();loadMe();loadProtocols();loadGroups();refreshAll();setInterval(refreshAll,1000);
+applyLang();loadMe();loadProtocols();loadGroups();refreshAll();setInterval(timerRefresh,3000);
 
 
 </script>
