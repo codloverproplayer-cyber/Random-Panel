@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import string
 import time
@@ -394,6 +395,62 @@ def sanitize_config_name(name: str) -> str:
 
 def auto_config_name() -> str:
     return random_config_name()
+
+
+_NAME_STRIP_RE = re.compile(r"[\x00-\x1f\x7f​-‏‪-‮⁦-⁩﻿]")
+
+
+def sanitize_display_name(name, max_len: int = 60) -> str:
+    """Clean a user-chosen name but keep it readable (spaces, Persian, emoji are fine).
+
+    Control / zero-width / bidi characters and runs of whitespace are removed so
+    names never turn into things like %20%20%20 in client apps.
+    """
+    cleaned = _NAME_STRIP_RE.sub("", str(name or ""))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned[:max_len].strip()
+
+
+def parse_config_names(raw, max_items: int = 40) -> list:
+    """Accept a list or a newline/comma separated string of per-config names."""
+    if isinstance(raw, str):
+        raw = raw.replace(",", "\n").splitlines()
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out = []
+    for item in raw:
+        n = sanitize_display_name(item)
+        if n:
+            out.append(n)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def sub_config_names(link: dict, count: int) -> list:
+    """Names for the `count` configs inside one subscription.
+
+    1. names typed in the panel (config_names) are used in order,
+    2. missing ones are filled as "<label>-2", "<label>-3", ...
+    3. a single config simply uses the label.
+    """
+    label = sanitize_display_name(link.get("label")) or "Config"
+    custom = parse_config_names(link.get("config_names") or [])
+    names, used = [], set()
+    for i in range(count):
+        if i < len(custom):
+            base = custom[i]
+        elif count == 1:
+            base = label
+        else:
+            base = f"{label}-{i + 1}"
+        name, n = base, 2
+        while name in used:
+            name = f"{base} ({n})"
+            n += 1
+        used.add(name)
+        names.append(name)
+    return names
 
 
 def now_ir():
@@ -1097,6 +1154,7 @@ def get_link_info(
         "category_number": int(cat.get("number", 0)),
         "category_name": str(cat.get("name", "عمومی")),
         "config_count": cfg_count,
+        "config_names": list(link.get("config_names") or []),
         "status_color": status_color,
         "connected_ips": connected_count,
         "show_vless": show_vless,
@@ -1424,6 +1482,7 @@ async def make_link(
     alarm_enabled: bool = False,
     category_id: str = "0",
     config_count: int = 1,
+    config_names=None,
 ):
 
     protocol = normalize_protocol(protocol)
@@ -1447,7 +1506,7 @@ async def make_link(
 
     record = {
         "label":
-            sanitize_config_name((label or "").strip() or random_config_name()),
+            sanitize_display_name(label) or random_config_name(),
 
         "limit_bytes":
             max(
@@ -1525,6 +1584,7 @@ async def make_link(
         "alarm_enabled": bool(alarm_enabled),
         "category_id": str(category_id or "0"),
         "config_count": max(1, min(40, int(config_count or 1))),
+        "config_names": parse_config_names(config_names or []),
         "usage_history": [],
     }
 
@@ -3001,10 +3061,10 @@ async def create_link_api(
         if ip_limit == 0: ip_limit = 1
         if connection_limit == 0: connection_limit = 1
     label_val = body.get("label", "")
-    if cat.get("random_name") or not str(label_val).strip():
+    if cat.get("random_name") or not sanitize_display_name(label_val):
         label_val = random_config_name()
     else:
-        label_val = sanitize_config_name(str(label_val))
+        label_val = sanitize_display_name(label_val)
 
     uid, link = await make_link(
         label=label_val,
@@ -3035,6 +3095,7 @@ async def create_link_api(
         alarm_enabled=alarm_enabled,
         category_id=category_id,
         config_count=config_count,
+        config_names=body.get("config_names"),
     )
 
     host = get_host(request)
@@ -3323,12 +3384,17 @@ async def update_link(
 
         if "label" in body:
 
-            value = str(
+            value = sanitize_display_name(
                 body["label"]
-            ).strip()
+            )
 
             if value:
-                link["label"] = value[:60]
+                link["label"] = value
+
+        if "config_names" in body:
+            link["config_names"] = parse_config_names(
+                body.get("config_names")
+            )
 
         if "note" in body:
 
@@ -3764,13 +3830,19 @@ def subscription_metadata_headers(used_bytes: int, limit_bytes: int, expires_at,
 
     userinfo = f"upload=0; download={used_bytes}; total={limit_bytes}; expire={expire_unix}"
 
+    # Header values must be ASCII, so the title is sent as "base64:<utf8 b64>".
+    # v2rayNG / v2rayN / Hiddify / Streisand decode this to the real name.
+    # (The old percent-encoded form was shown raw by some clients: %20%20...)
+    title = sanitize_display_name(title, 120) or "PXPanel"
+    safe_name = quote(title, safe="")
+
     return {
-        "profile-title": quote(title, safe=""),
+        "profile-title": "base64:" + base64.b64encode(title.encode("utf-8")).decode("ascii"),
         "profile-web-page-url": info_url,
         "support-url": SUPPORT_URL,
         "profile-update-interval": "12",
         "subscription-userinfo": userinfo,
-        "content-disposition": 'inline; filename="subscription.txt"',
+        "content-disposition": f"inline; filename=\"subscription.txt\"; filename*=UTF-8''{safe_name}",
     }
 
 # ============================================================
@@ -3821,22 +3893,19 @@ async def subscription_single(
     lines = [stats_line]
     used_names = set()
     cfg_count = max(1, min(40, int(link.get("config_count") or 1)))
+    names = sub_config_names(link, cfg_count)
     if clean_ips:
         hosts = list(clean_ips)
         while len(hosts) < cfg_count:
             hosts.extend(clean_ips)
         hosts = hosts[:cfg_count]
-        for cip in hosts:
-            name = random_config_name(used_names)
-            used_names.add(name)
-            lines.append(generate_vless_link(uuid, cip, remark=name, protocol=link.get("protocol", DEFAULT_PROTOCOL), fingerprint=link.get("fingerprint", DEFAULT_FINGERPRINT), alpn=link.get("alpn"), port=link.get("port", DEFAULT_PORT)))
     else:
-        for i in range(cfg_count):
-            name = random_config_name(used_names)
-            used_names.add(name)
-            lines.append(generate_vless_link(uuid, host, remark=name, protocol=link.get("protocol", DEFAULT_PROTOCOL), fingerprint=link.get("fingerprint", DEFAULT_FINGERPRINT), alpn=link.get("alpn"), port=link.get("port", DEFAULT_PORT)))
+        hosts = [host] * cfg_count
+    for cip, name in zip(hosts, names):
+        lines.append(generate_vless_link(uuid, cip, remark=name, protocol=link.get("protocol", DEFAULT_PROTOCOL), fingerprint=link.get("fingerprint", DEFAULT_FINGERPRINT), alpn=link.get("alpn"), port=link.get("port", DEFAULT_PORT)))
     content = base64.b64encode("\n".join(lines).encode()).decode()
-    profile_title = f"0.0.0.0 | {stats_remark}"
+    # The sub title is just the name set in the panel (usage is in subscription-userinfo).
+    profile_title = label
     headers = subscription_metadata_headers(
         used,
         limit,
@@ -4881,10 +4950,7 @@ async def sub_group_subscription(
         else f"{fmt_bytes(total_used)}/∞"
     )
     group_expiry_text = group_expiry or "∞"
-    group_title = (
-        f"0.0.0.0 | {group_volume_text} | {group_expiry_text} | "
-        f"{sub['name']} | کانال تلگرام: logic_sec"
-    )
+    group_title = str(sub.get("name") or "PXPanel")
     headers = subscription_metadata_headers(
         total_used,
         group_limit,
@@ -5364,7 +5430,9 @@ async def mix_subscription(request: Request, _=Depends(require_auth)):
             labels.append(str(link.get("label") or lid[:8]))
             total_used += int(link.get("used_bytes", 0) or 0)
             total_limit += int(link.get("limit_bytes", 0) or 0)
-            name = random_config_name(used_names)
+            name = sub_config_names(link, 1)[0]
+            if name in used_names:
+                name = f"{name} ({len(used_names) + 1})"
             used_names.add(name)
             lines.append(generate_vless_link(
                 lid, host, remark=name,
@@ -6771,6 +6839,7 @@ tr:hover td{background:var(--hover)}
         <div class="field"><label data-i18n="label_count">تعداد کانفیگ در ساب (۱–۴۰)</label><input id="cCount" type="number" value="1" min="1" max="40"></div>
         <div class="field"><label data-i18n="label_days">انقضـا (روز)</label><input id="cDays" type="number" value="0" min="0"></div>
       </div>
+      <div class="field"><label>نام کانفیگ‌ها در ساب (هر خط یک نام، اختیاری)</label><textarea id="cNames" rows="3" placeholder="Config 1&#10;Config 2"></textarea></div>
       <div class="form-row">
         <div class="field"><label data-i18n="label_limit">محدودیت حجم</label><input id="cLimit" type="number" value="0" min="0"></div>
         <div class="field"><label data-i18n="label_unit">واحد</label><select id="cUnit"><option>GB</option><option>MB</option><option>KB</option></select></div>
@@ -7320,6 +7389,7 @@ async function doManualCreate(){
     protocol:document.getElementById('cProto')?.value||undefined,
     category_id:document.getElementById('cGroup')?.value||'0',
     config_count:Math.max(1,Math.min(40,Number(document.getElementById('cCount').value)||1)),
+    config_names:(document.getElementById('cNames')?.value||'').split('\n').map(s=>s.trim()).filter(Boolean),
     limit_value:Number(document.getElementById('cLimit').value)||0,
     limit_unit:document.getElementById('cUnit').value||'GB',
     expires_days:Number(document.getElementById('cDays').value)||0,
