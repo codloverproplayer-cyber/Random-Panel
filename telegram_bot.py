@@ -39,8 +39,8 @@ from main import (
     activity_logs,
 )
 
-BOT_NAME = "پی ایکس بات"
-BOT_NAME_EN = "PX Bot"
+BOT_NAME = "ربات آرورا"
+BOT_NAME_EN = "Aurora Bot"
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 _admin_ids_raw = os.environ.get("TELEGRAM_ADMIN_IDS", "").strip()
@@ -63,9 +63,6 @@ WIZARD_STEPS = ["label", "protocol", "fingerprint", "alpn", "port", "volume", "s
 
 PROTOCOL_LABELS = {
     "vless-ws": "🟢 VLESS · WebSocket",
-    "xhttp-packet-up": "⚡ XHTTP packet-up",
-    "xhttp-stream-up": "⚡ XHTTP stream-up",
-    "xhttp-stream-one": "⚡ XHTTP stream-one",
     "vmess-ws": "🔵 VMess · WS",
     "trojan-ws": "🟠 Trojan · WS",
     "shadowsocks": "🟣 Shadowsocks",
@@ -580,7 +577,7 @@ def _wizard_prompt(step: str) -> tuple[str, dict | None]:
 
 
 async def _wizard_finish(chat_id: int, data: dict):
-    label = data.get("label") or "px-" + os.urandom(3).hex()
+    label = data.get("label") or "aurora-" + os.urandom(3).hex()
     protocol = data.get("protocol") or DEFAULT_PROTOCOL
     fingerprint = data.get("fingerprint") or DEFAULT_FINGERPRINT
     alpn = data.get("alpn") or DEFAULT_ALPN_BY_PROTOCOL.get(protocol, "http/1.1")
@@ -673,7 +670,7 @@ async def _handle_message(msg: dict):
             return
         name = text[:40] or "group"
         try:
-            sid, sub = await create_sub_group(name=name, desc="از پی ایکس بات")
+            sid, sub = await create_sub_group(name=name, desc="از ربات آرورا")
             _pending.pop(chat_id, None)
             await _send(chat_id, _format_sub_detail(sid, sub), _sub_detail_kb(sid))
         except Exception as e:
@@ -995,7 +992,7 @@ async def _handle_callback(cb: dict):
 
     if data == "w:randlabel":
         st = _pending.setdefault(chat_id, {"action": "wizard", "step": "label", "data": {}})
-        st["data"]["label"] = "px" + os.urandom(4).hex()
+        st["data"]["label"] = "aurora" + os.urandom(4).hex()
         st["step"] = "protocol"
         prompt, kb = _wizard_prompt("protocol")
         await _edit(chat_id, mid, prompt, kb)

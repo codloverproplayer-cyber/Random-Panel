@@ -17,6 +17,7 @@ from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote, parse_qs
+from sub_pages import render_info, render_group_page, render_not_found
 import aiofiles
 import httpx
 import uvicorn
@@ -39,7 +40,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ============================================================
 
 APP_NAME = "Aurora Panel"
-APP_VERSION = "14.1.0"
+APP_VERSION = "14.2.0"
 
 SUPPORT_USERNAME = "@logic_sec"
 SUPPORT_URL = "https://t.me/logic_sec"
@@ -193,7 +194,7 @@ SUBS: dict = {}
 SESSIONS: dict = {}
 connections: dict = {}
 CATEGORIES: dict = {}
-SETTINGS: dict = {"default_name": ""}
+SETTINGS: dict = {"default_config_name": ""}
 
 stats = {
     "total_bytes": 0,
@@ -216,9 +217,6 @@ http_client: httpx.AsyncClient | None = None
 
 PROTOCOLS = (
     "vless-ws",
-    "xhttp-packet-up",
-    "xhttp-stream-up",
-    "xhttp-stream-one",
     "vmess-ws",
     "trojan-ws",
     "shadowsocks",
@@ -227,18 +225,14 @@ PROTOCOLS = (
     "hysteria2",
     "tuic",
     "wireguard",
-    "highspeed-demo",
     "gaming-lite-demo",
 )
 
-# Only these transports are actually implemented by the relay (VLESS over WS / XHTTP).
-WORKING_PROTOCOLS = ("vless-ws", "xhttp-packet-up", "xhttp-stream-up", "xhttp-stream-one")
+# Only this transport is actually implemented by the relay (VLESS over WebSocket, TCP + UDP).
+WORKING_PROTOCOLS = ("vless-ws",)
 
 PROTOCOL_LABELS = {
     "vless-ws": "VLESS WebSocket",
-    "xhttp-packet-up": "XHTTP Packet Up",
-    "xhttp-stream-up": "XHTTP Stream Up",
-    "xhttp-stream-one": "XHTTP Stream One",
     "vmess-ws": "VMess WebSocket",
     "trojan-ws": "Trojan WebSocket",
     "shadowsocks": "Shadowsocks",
@@ -247,7 +241,6 @@ PROTOCOL_LABELS = {
     "hysteria2": "Hysteria 2",
     "tuic": "TUIC",
     "wireguard": "WireGuard",
-    "highspeed-demo": "HighSpeed Upload/Download (دمو)",
     "gaming-lite-demo": "Gaming Lite (دمو)",
 }
 
@@ -275,9 +268,6 @@ DEFAULT_FINGERPRINT = "chrome"
 
 DEFAULT_ALPN_BY_PROTOCOL = {
     "vless-ws": "http/1.1",
-    "xhttp-packet-up": "h2,http/1.1",
-    "xhttp-stream-up": "h2,http/1.1",
-    "xhttp-stream-one": "h2,http/1.1",
 }
 
 DEFAULT_PORT = 443
@@ -287,8 +277,16 @@ MAX_PORT = 65535
 DEFAULT_SPEED_LIMIT = 0
 
 
+def is_removed_protocol(value) -> bool:
+    """XHTTP (and the old XHTTP-based demo) were removed; such links fall back to WebSocket."""
+    v = str(value or "").strip().lower()
+    return v.startswith("xhttp") or v == "highspeed-demo"
+
+
 def normalize_protocol(protocol: str | None) -> str:
     value = str(protocol or DEFAULT_PROTOCOL).strip().lower()
+    if is_removed_protocol(value):
+        return DEFAULT_PROTOCOL
     value = PROTOCOL_ALIASES.get(value, value)
     return value if value in PROTOCOLS else DEFAULT_PROTOCOL
 
@@ -431,7 +429,18 @@ def parse_config_names(raw, max_items: int = 40) -> list:
     return out
 
 
-# Transports this server really implements (VLESS over WebSocket / XHTTP).
+def migrate_link(link: dict) -> None:
+    """Bring old records up to date (XHTTP was removed -> WebSocket)."""
+    if is_removed_protocol(link.get("protocol")):
+        link["protocol"] = DEFAULT_PROTOCOL
+        link["alpn"] = ""
+        link["protocol_label"] = PROTOCOL_LABELS.get(DEFAULT_PROTOCOL, DEFAULT_PROTOCOL)
+    for entry in link.get("entries") or []:
+        if isinstance(entry, dict) and is_removed_protocol(entry.get("protocol")):
+            entry["protocol"] = DEFAULT_PROTOCOL
+
+
+# Transports this server really implements (VLESS over WebSocket).
 MULTI_PROTOCOLS = WORKING_PROTOCOLS
 _ADDR_RE = re.compile(r"^[A-Za-z0-9._\-:\[\]]{1,253}$")
 
@@ -467,26 +476,8 @@ def parse_entries(raw, max_items: int = 40) -> list:
     return out
 
 
-def default_label() -> str:
-    """Name used when the creator leaves the name empty (Settings -> default name)."""
-    base = sanitize_display_name(SETTINGS.get("default_name"))
-    if not base:
-        return random_config_name()
-    template = base if "{n}" in base else base + "-{n}"
-    pattern = re.compile("^" + re.escape(template).replace(re.escape("{n}"), r"(\d+)") + "$")
-    highest = 0
-    for link in LINKS.values():
-        m = pattern.match(str(link.get("label") or ""))
-        if m:
-            highest = max(highest, int(m.group(1)))
-    return template.replace("{n}", str(highest + 1))
-
-
 PROTOCOL_SHORT = {
     "vless-ws": "Web Socket",
-    "xhttp-packet-up": "XHTTP Packet Up",
-    "xhttp-stream-up": "XHTTP Stream Up",
-    "xhttp-stream-one": "XHTTP Stream One",
 }
 _VAR_RE = re.compile(r"\{(\w+)\}")
 
@@ -513,19 +504,26 @@ def sub_config_names(link: dict, count: int, ctxs=None) -> list:
     """Names for the `count` configs inside one subscription.
 
     1. names typed in the panel (config_names) are used in order,
-    2. missing ones use the label ("<label>-2", "<label>-3", ...; a label that
+    2. missing ones use the default config name from Settings (if set; a number
+       is appended when there are several configs and the name has no {i}),
+       otherwise the label ("<label>-2", "<label>-3", ...; a label that
        contains {variables} is used as-is for every config),
     3. a single config simply uses the label.
     Variables such as {protocol} are filled per config from `ctxs`.
     """
     label = sanitize_display_name(link.get("label")) or "Config"
     custom = parse_config_names(link.get("config_names") or [])
+    default_tpl = sanitize_display_name(SETTINGS.get("default_config_name"), 80)
     has_var = bool(_VAR_RE.search(label))
     names, used = [], set()
     for i in range(count):
         ctx = (ctxs[i] if ctxs and i < len(ctxs) else None) or {}
         if i < len(custom):
             base = custom[i]
+        elif default_tpl:
+            base = default_tpl
+            if count > 1 and not re.search(r"\{(i|n|address)\}", base, re.I):
+                base += " {i}"
         elif count == 1 or has_var:
             base = label
         else:
@@ -1159,10 +1157,6 @@ def generate_vless_link(
     if protocol == "vless-ws":
         q = {"encryption":"none","security":"tls","type":"ws","host":host,"path":f"/ws/{uuid}","sni":host,"fp":fp,"alpn":alpn_value}
         return "vless://" + uuid + "@" + server + ":" + str(port_value) + "?" + "&".join(f"{k}={quote(str(v), safe=',/') }" for k,v in q.items()) + "#" + label
-    if protocol.startswith("xhttp-"):
-        mode = protocol.replace("xhttp-", "")
-        q = {"encryption":"none","security":"tls","type":"xhttp","mode":mode,"host":host,"path":f"/xhttp-siz10/{mode}/{uuid}","sni":host,"fp":fp,"alpn":alpn_value}
-        return "vless://" + uuid + "@" + server + ":" + str(port_value) + "?" + "&".join(f"{k}={quote(str(v), safe=',/') }" for k,v in q.items()) + "#" + label
     if protocol == "vmess-ws":
         raw = {"v":"2","ps":remark,"add":server,"port":port_value,"id":uuid,"aid":0,"scy":"auto","net":"ws","type":"none","host":host,"path":f"/ws/{uuid}","tls":"tls","sni":host,"fp":fp}
         return "vmess://" + base64.b64encode(json.dumps(raw,separators=(",",":"),ensure_ascii=False).encode()).decode()
@@ -1177,9 +1171,6 @@ def generate_vless_link(
     if protocol == "hysteria2": return f"hysteria2://{uuid}@{host}:{port_value}/?sni={quote(host)}&insecure=0#{label}"
     if protocol == "tuic": return f"tuic://{uuid}:{uuid}@{host}:{port_value}?sni={quote(host)}&alpn=h3#{label}"
     if protocol == "wireguard": return f"wireguard://{uuid}@{host}:{port_value}?publicKey={uuid}#{label}"
-    if protocol == "highspeed-demo":
-        q = {"encryption":"none","security":"tls","type":"xhttp","mode":"stream-up","host":host,"path":f"/xhttp-siz10/stream-up/{uuid}","sni":host,"fp":fp,"alpn":"h2,http/1.1"}
-        return "vless://" + uuid + "@" + server + ":" + str(port_value) + "?" + "&".join(f"{k}={quote(str(v), safe=',/')}" for k,v in q.items()) + "#" + label
     if protocol == "gaming-lite-demo":
         return f"hysteria2://{uuid}@{host}:{port_value}/?sni={quote(host)}&insecure=0&obfs=salamander#{label}"
     return f"vless://{uuid}@{host}:{port_value}"
@@ -1192,10 +1183,10 @@ def vless_link_for_link(
     return generate_vless_link(
         uid,
         host,
-        remark=render_name(
-            sanitize_display_name(link.get("label")) or "Config",
-            protocol=link.get("protocol"), i=1, host=host, port=link.get("port"),
-        ),
+        remark=sub_config_names(
+            link, 1,
+            [{"protocol": link.get("protocol"), "address": host, "port": link.get("port"), "host": host}],
+        )[0],
         protocol=link.get(
             "protocol",
             DEFAULT_PROTOCOL,
@@ -1320,6 +1311,10 @@ async def load_state():
         )
 
         SETTINGS.update(data.get("settings") or {})
+        # older versions stored this as "default_name" (and wrongly used it for sub names)
+        if "default_config_name" not in (data.get("settings") or {}) and SETTINGS.get("default_name"):
+            SETTINGS["default_config_name"] = SETTINGS["default_name"]
+        SETTINGS.pop("default_name", None)
 
         ADMIN_ACCOUNTS.clear()
         ADMIN_ACCOUNTS.update(data.get("admin_accounts") or {})
@@ -1385,6 +1380,7 @@ async def load_state():
             link.setdefault("config_count", 1)
             link.setdefault("sort_order", 0)
             link.setdefault("usage_history", [])
+            migrate_link(link)
 
         logger.info(
             "State loaded: %d links / %d subscriptions",
@@ -1539,6 +1535,7 @@ async def restore_state(request: Request, _=Depends(require_auth)):
             link.setdefault("category_id", "0")
             link.setdefault("config_count", 1)
             link.setdefault("usage_history", [])
+            migrate_link(link)
             LINKS[uid] = link
     async with SUBS_LOCK:
         for sid, sub in subs.items():
@@ -1547,8 +1544,9 @@ async def restore_state(request: Request, _=Depends(require_auth)):
     for cid, cat in cats.items():
         if isinstance(cat, dict):
             CATEGORIES[cid] = cat
-    if isinstance(body.get("settings"), dict) and not SETTINGS.get("default_name"):
-        SETTINGS["default_name"] = sanitize_display_name(body["settings"].get("default_name"), 40)
+    if isinstance(body.get("settings"), dict) and not SETTINGS.get("default_config_name"):
+        bs = body["settings"]
+        SETTINGS["default_config_name"] = sanitize_display_name(bs.get("default_config_name") or bs.get("default_name"), 80)
     await save_state()
     log_activity("system", f"Backup restored: {len(links)} links", "ok")
     return {"ok": True, "links": len(links), "subs": len(subs), "categories": len(cats)}
@@ -1559,8 +1557,9 @@ async def restore_state(request: Request, _=Depends(require_auth)):
 # ============================================================
 
 def _settings_payload() -> dict:
-    name = SETTINGS.get("default_name") or ""
-    return {"default_name": name, "next_name": default_label() if name else ""}
+    tpl = SETTINGS.get("default_config_name") or ""
+    preview = render_name(tpl, protocol=DEFAULT_PROTOCOL, i=1, host="example.com", port=DEFAULT_PORT) if tpl else ""
+    return {"default_config_name": tpl, "preview": preview}
 
 
 @app.get("/api/settings")
@@ -1576,8 +1575,9 @@ async def save_settings(request: Request, _=Depends(require_auth)):
         raise HTTPException(status_code=400, detail="JSON نامعتبر")
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="JSON نامعتبر")
-    if "default_name" in body:
-        SETTINGS["default_name"] = sanitize_display_name(body.get("default_name"), 40)
+    key = "default_config_name" if "default_config_name" in body else ("default_name" if "default_name" in body else None)
+    if key:
+        SETTINGS["default_config_name"] = sanitize_display_name(body.get(key), 80)
     await save_state()
     return {"ok": True, **_settings_payload()}
 
@@ -1731,7 +1731,7 @@ async def make_link(
 
     record = {
         "label":
-            sanitize_display_name(label) or default_label(),
+            sanitize_display_name(label) or random_config_name(),
 
         "limit_bytes":
             max(
@@ -2577,7 +2577,7 @@ LOGIN_HTML = r"""
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>پی ایکس پنل</title>
+<title>پنل آرورا</title>
 <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -2612,7 +2612,7 @@ button:disabled{opacity:.5;cursor:not-allowed}
 </head>
 <body>
 <div class="card">
-  <h1>پی ایکس پنل</h1>
+  <h1>پنل آرورا</h1>
 
   <div id="setupBox" class="hidden">
     <div class="warn">
@@ -3271,10 +3271,8 @@ async def create_link_api(
         if ip_limit == 0: ip_limit = 1
         if connection_limit == 0: connection_limit = 1
     label_val = body.get("label", "")
-    if cat.get("random_name"):
+    if cat.get("random_name") or not sanitize_display_name(label_val):
         label_val = random_config_name()
-    elif not sanitize_display_name(label_val):
-        label_val = default_label()
     else:
         label_val = sanitize_display_name(label_val)
 
@@ -3351,7 +3349,7 @@ async def create_auto_link(
     cfg = profiles.get(profile, profiles["balanced"])
     config_count = safe_int(body.get("config_count", 1), minimum=1, maximum=40)
     uid, link = await make_link(
-        label=default_label(), limit_bytes=0, expires_at=None,
+        label=auto_config_name(), limit_bytes=0, expires_at=None,
         ip_limit=cfg["ip"], speed_limit_bytes=cfg["speed"], connection_limit=cfg["conn"],
         note=f"Auto generated by Aurora Panel | profile={profile}",
         protocol=protocol, fingerprint=cfg["fp"],
@@ -4079,8 +4077,8 @@ _VPN_CLIENT_HINTS = (
 )
 
 
-def entry_lines(link: dict, uid: str, host: str) -> list:
-    """One share link per multi-protocol entry (empty list when the link has none)."""
+def entry_items(link: dict, uid: str, host: str) -> list:
+    """Configs defined by the multi-address rows of a link (empty when it has none)."""
     entries = link.get("entries") or []
     if not entries:
         return []
@@ -4092,19 +4090,62 @@ def entry_lines(link: dict, uid: str, host: str) -> list:
     names = sub_config_names(link, len(entries), ctxs)
     out = []
     for idx, (entry, default_name) in enumerate(zip(entries, names)):
-        proto = entry.get("protocol") or DEFAULT_PROTOCOL
+        proto = normalize_protocol(entry.get("protocol"))
         c = ctxs[idx]
-        out.append(generate_vless_link(
-            uid, host,
-            remark=render_name(entry.get("name"), protocol=proto, i=idx + 1, address=c["address"], port=c["port"], host=host) if entry.get("name") else default_name,
-            protocol=proto,
-            fingerprint=link.get("fingerprint", DEFAULT_FINGERPRINT),
-            alpn=link.get("alpn") if proto == link.get("protocol") else None,
-            port=entry.get("port") or link.get("port", DEFAULT_PORT),
-            address=entry.get("address"),
-            sni=entry.get("sni"),
-        ))
+        name = (
+            render_name(entry.get("name"), protocol=proto, i=idx + 1, address=c["address"], port=c["port"], host=host)
+            if entry.get("name") else default_name
+        )
+        out.append({
+            "name": name,
+            "address": c["address"],
+            "protocol": proto,
+            "port": c["port"],
+            "url": generate_vless_link(
+                uid, host, remark=name, protocol=proto,
+                fingerprint=link.get("fingerprint", DEFAULT_FINGERPRINT),
+                alpn=link.get("alpn") if proto == link.get("protocol") else None,
+                port=c["port"], address=entry.get("address"), sni=entry.get("sni"),
+            ),
+        })
     return out
+
+
+def entry_lines(link: dict, uid: str, host: str) -> list:
+    return [e["url"] for e in entry_items(link, uid, host)]
+
+
+def build_sub_entries(link: dict, uid: str, host: str) -> list:
+    """Every config that goes into this link's subscription: name, address, protocol, port, url."""
+    items = entry_items(link, uid, host)
+    if items:
+        return items
+    cfg_count = max(1, min(40, int(link.get("config_count") or 1)))
+    clean_ips = link.get("clean_ips") or []
+    if clean_ips:
+        hosts = list(clean_ips)
+        while len(hosts) < cfg_count:
+            hosts.extend(clean_ips)
+        hosts = hosts[:cfg_count]
+    else:
+        hosts = [host] * cfg_count
+    proto = normalize_protocol(link.get("protocol"))
+    port = link.get("port", DEFAULT_PORT)
+    names = sub_config_names(
+        link, cfg_count,
+        [{"protocol": proto, "address": h, "port": port, "host": host} for h in hosts],
+    )
+    return [
+        {
+            "name": name, "address": h, "protocol": proto, "port": port,
+            "url": generate_vless_link(
+                uid, h, remark=name, protocol=proto,
+                fingerprint=link.get("fingerprint", DEFAULT_FINGERPRINT),
+                alpn=link.get("alpn"), port=port,
+            ),
+        }
+        for h, name in zip(hosts, names)
+    ]
 
 
 def wants_html(request: Request) -> bool:
@@ -4174,26 +4215,7 @@ async def subscription_single(
     )
     stats_remark = f"{label} | {volume_text} | {time_text}"
     stats_line = generate_vless_link(uuid, "0.0.0.0", remark=stats_remark, protocol=link.get("protocol", DEFAULT_PROTOCOL), fingerprint=link.get("fingerprint", DEFAULT_FINGERPRINT), alpn=link.get("alpn"), port=link.get("port", DEFAULT_PORT))
-    lines = [stats_line]
-    used_names = set()
-    cfg_count = max(1, min(40, int(link.get("config_count") or 1)))
-    multi = entry_lines(link, uuid, host)
-    if multi:
-        lines.extend(multi)
-        hosts = []
-    elif clean_ips:
-        hosts = list(clean_ips)
-        while len(hosts) < cfg_count:
-            hosts.extend(clean_ips)
-        hosts = hosts[:cfg_count]
-    else:
-        hosts = [host] * cfg_count
-    names = sub_config_names(
-        link, cfg_count,
-        [{"protocol": link.get("protocol"), "address": h, "port": link.get("port"), "host": host} for h in hosts],
-    ) if hosts else []
-    for cip, name in zip(hosts, names):
-        lines.append(generate_vless_link(uuid, cip, remark=name, protocol=link.get("protocol", DEFAULT_PROTOCOL), fingerprint=link.get("fingerprint", DEFAULT_FINGERPRINT), alpn=link.get("alpn"), port=link.get("port", DEFAULT_PORT)))
+    lines = [stats_line] + [e["url"] for e in build_sub_entries(link, uuid, host)]
     content = base64.b64encode("\n".join(lines).encode()).decode()
     # The sub title is just the name set in the panel (usage is in subscription-userinfo).
     profile_title = label
@@ -4271,23 +4293,19 @@ async def info_page(
     async with LINKS_LOCK:
         link = LINKS.get(uid)
         if not link:
-            return HTMLResponse("<html lang=\"fa\" dir=\"rtl\"><body style=\"margin:0;background:#07070a;color:#fff;font-family:sans-serif;padding:40px\"><h2>کانفیگ پیدا نشد</h2></body></html>", status_code=404)
+            return HTMLResponse(render_not_found(), status_code=404, headers={"Cache-Control": "no-store"})
         snapshot = dict(link)
 
     host = get_host(request)
-    vless_url = vless_link_for_link(snapshot, uid, host)
     sub_url = f"https://{host}/sub/{uid}"
     used = int(snapshot.get("used_bytes", 0) or 0)
     limit = int(snapshot.get("limit_bytes", 0) or 0)
-    if limit > 0:
-        usage_percent = max(0, min(100, round((used / limit) * 100, 1)))
-        usage_value = f"{fmt_bytes(used)} / {fmt_bytes(limit)}"
-        remaining_value = fmt_bytes(max(0, limit - used))
-    else:
-        usage_percent = 0
-        usage_value = f"{fmt_bytes(used)} / نامحدود"
-        remaining_value = "نامحدود"
+    percent = max(0.0, min(100.0, round((used / limit) * 100, 1))) if limit > 0 else None
+    remaining_value = fmt_bytes(max(0, limit - used)) if limit > 0 else "نامحدود"
 
+    time_left = "نامحدود"
+    time_pct = None
+    time_warn = False
     expires_at = snapshot.get("expires_at")
     if expires_at:
         try:
@@ -4295,581 +4313,91 @@ async def info_page(
             now_dt = datetime.now(expiry_dt.tzinfo) if expiry_dt.tzinfo else datetime.now()
             seconds = int((expiry_dt - now_dt).total_seconds())
             if seconds <= 0:
-                expiry_remaining = "منقضی شده"
+                time_left = "منقضی شده"
+                time_pct = 100.0
+                time_warn = True
             else:
                 days, rem = divmod(seconds, 86400)
                 hours, rem = divmod(rem, 3600)
                 minutes, _ = divmod(rem, 60)
-                expiry_remaining = f"{days} روز و {hours} ساعت" if days else (f"{hours} ساعت و {minutes} دقیقه" if hours else f"{minutes} دقیقه")
+                time_left = f"{days} روز و {hours} ساعت" if days else (f"{hours} ساعت و {minutes} دقیقه" if hours else f"{minutes} دقیقه")
+                time_warn = seconds < 3 * 86400
+                try:
+                    created_dt = datetime.fromisoformat(str(snapshot.get("created_at")))
+                    if created_dt.tzinfo is None and expiry_dt.tzinfo is not None:
+                        created_dt = created_dt.replace(tzinfo=expiry_dt.tzinfo)
+                    total = (expiry_dt - created_dt).total_seconds()
+                    if total > 0:
+                        time_pct = max(0.0, min(100.0, (total - seconds) / total * 100))
+                except Exception:
+                    time_pct = None
         except Exception:
-            expiry_remaining = "نامشخص"
-        expiry_display = str(expires_at)
+            time_left = "نامشخص"
+        expiry_text = str(expires_at)[:16].replace("T", " ")
     else:
-        expiry_remaining = "نامحدود"
-        expiry_display = "نامحدود"
+        expiry_text = "نامحدود"
 
-    status_text = "فعال" if is_link_allowed(snapshot) else "غیرفعال"
-    status_class = "good" if status_text == "فعال" else "bad"
-    ip_limit = "نامحدود" if not snapshot.get("ip_limit", 0) else str(snapshot.get("ip_limit"))
-    connection_limit = "نامحدود" if not snapshot.get("connection_limit", 0) else str(snapshot.get("connection_limit"))
-    speed_limit = "نامحدود" if not snapshot.get("speed_limit_bytes", 0) else fmt_bytes(snapshot.get("speed_limit_bytes", 0)) + "/s"
+    allowed = is_link_allowed(snapshot)
+    if allowed:
+        state, state_text = "ok", "فعال"
+    else:
+        state = "bad"
+        state_text = "منقضی" if is_link_expired(snapshot) else "غیرفعال"
 
     usage_history = snapshot.get("usage_history", [])
-    svg_points = "0,50 300,50"
+    svg_points = ""
     if usage_history and len(usage_history) > 1:
         max_hist = max(usage_history) if max(usage_history) > 0 else 1
         pts = []
         step = 300 / (len(usage_history) - 1)
-        for i, val in enumerate(usage_history):
-            x = i * step
-            y = 60 - min(60, max(4, (val / max_hist) * 52))
-            pts.append(f"{x:.1f},{y:.1f}")
+        for idx, val in enumerate(usage_history):
+            pts.append(f"{idx * step:.1f},{60 - min(60, max(4, (val / max_hist) * 52)):.1f}")
         svg_points = " ".join(pts)
-    elif usage_history and len(usage_history) == 1:
-        svg_points = f"0,50 300,{60 - min(60, max(4, (usage_history[0] / (limit if limit > 0 else max(used, 1))) * 52)):.1f}"
 
-    status_badge_html = 'text-emerald-300 border border-emerald-400/25 bg-emerald-400/10' if status_class == 'good' else 'text-rose-300 border border-rose-400/25 bg-rose-400/10'
-    label_escaped = escape_html(render_name(
-        snapshot.get("label", "Aurora Panel"),
+    name = render_name(
+        sanitize_display_name(snapshot.get("label")) or "Config",
         protocol=snapshot.get("protocol"), i=1, host=host, port=snapshot.get("port"),
-    ))
-    uid_escaped = escape_html(uid)
-    app_version_str = escape_html(str(APP_VERSION))
-    used_bytes_str = escape_html(fmt_bytes(used))
-    limit_bytes_str = escape_html(fmt_bytes(limit)) if limit > 0 else '∞'
-    remaining_value_escaped = escape_html(remaining_value)
-    expiry_remaining_escaped = escape_html(expiry_remaining)
-    expiry_display_escaped = escape_html(expiry_display)
-    ip_limit_escaped = escape_html(ip_limit)
-    connection_limit_escaped = escape_html(connection_limit)
-    speed_limit_escaped = escape_html(speed_limit)
-    _entries = snapshot.get("entries") or []
-    if _entries:
-        protocol_escaped = escape_html("multi: " + ", ".join(dict.fromkeys(e.get("protocol", "") for e in _entries)))
-    else:
-        protocol_escaped = escape_html(snapshot.get("protocol", "vless-ws"))
-    fingerprint_escaped = escape_html(snapshot.get("fingerprint", "chrome"))
-    vless_url_escaped = escape_html(vless_url)
-    sub_url_escaped = escape_html(sub_url)
+    )
     _sub_q = quote(sub_url, safe="")
-    _name_q = quote(render_name(snapshot.get("label") or "Aurora Panel", protocol=snapshot.get("protocol"), i=1, host=host, port=snapshot.get("port")), safe="")
-    deeplink_v2rayng = escape_html(f"v2rayng://install-sub?url={_sub_q}&name={_name_q}")
-    deeplink_hiddify = escape_html(f"hiddify://import/{sub_url}#{_name_q}")
-    deeplink_streisand = escape_html(f"streisand://import/{sub_url}")
-    dash_calc_offset = f"{339.29 - (339.29 * min(usage_percent, 100) / 100):.1f}"
+    _name_q = quote(name, safe="")
+    configs = [
+        {
+            "name": e["name"], "url": e["url"], "address": e["address"], "port": e["port"],
+            "protocol": PROTOCOL_SHORT.get(e["protocol"], PROTOCOL_LABELS.get(e["protocol"], e["protocol"])),
+        }
+        for e in build_sub_entries(snapshot, uid, host)
+    ]
+    proto_label = PROTOCOL_SHORT.get(normalize_protocol(snapshot.get("protocol")), "Web Socket")
 
-    info_html = f"""<!DOCTYPE html>
-<html lang="fa" dir="rtl">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>{label_escaped} | INFO</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
-<link rel="preconnect" href="https://cdn.tailwindcss.com" crossorigin>
-<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
-<script src="https://cdn.tailwindcss.com"></script>
-<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js" defer></script>
-<script>
-  tailwind.config = {{
-    theme: {{
-      extend: {{
-        fontFamily: {{ vazir: ['Vazirmatn','system-ui','sans-serif'] }},
-        colors: {{
-          blue: {{50:'#f0fdfa',100:'#ccfbf1',200:'#99f6e4',300:'#5eead4',400:'#2dd4bf',500:'#14b8a6',600:'#0d9488',700:'#0f766e',800:'#115e59',900:'#134e4a'}},
-          purple: {{50:'#f5f3ff',100:'#ede9fe',200:'#ddd6fe',300:'#c4b5fd',400:'#a78bfa',500:'#8b5cf6',600:'#7c3aed',700:'#6d28d9',800:'#5b21b6',900:'#4c1d95'}}
-        }}
-      }}
-    }}
-  }}
-</script>
-<style>
-  :root {{
-    --bg-main: #050b14;
-    --bg-card: rgba(255, 255, 255, 0.04);
-    --bg-card-hover: rgba(255, 255, 255, 0.07);
-    --border-color: rgba(255, 255, 255, 0.1);
-    --text-main: #f1f5f9;
-    --text-muted: rgba(255, 255, 255, 0.4);
-    --bg-sub-card: rgba(0, 0, 0, 0.2);
-    --grad-1: rgba(45,212,191,.20);
-    --grad-2: rgba(139,92,246,.16);
-    --grad-3: rgba(74,222,128,.11);
-  }}
-
-  body.theme-lighter {{
-    --bg-main: #0d1a2b;
-    --bg-card: rgba(255, 255, 255, 0.075);
-    --bg-card-hover: rgba(255, 255, 255, 0.115);
-    --border-color: rgba(255, 255, 255, 0.16);
-    --text-main: #ffffff;
-    --text-muted: rgba(255, 255, 255, 0.6);
-    --bg-sub-card: rgba(0, 0, 0, 0.35);
-    --grad-1: rgba(45,212,191,.26);
-    --grad-2: rgba(139,92,246,.20);
-    --grad-3: rgba(74,222,128,.15);
-  }}
-
-  html,body{{background:var(--bg-main); transition: background 0.3s ease, color 0.3s ease;}}
-  body{{
-    background:
-      radial-gradient(ellipse 80% 50% at 10% -10%, var(--grad-1), transparent 50%),
-      radial-gradient(ellipse 60% 40% at 95% 15%, var(--grad-2), transparent 45%),
-      radial-gradient(ellipse 55% 35% at 60% 100%, var(--grad-3), transparent 40%),
-      var(--bg-main);
-  }}
-  .status-dot{{box-shadow:0 0 10px currentColor}}
-  ::-webkit-scrollbar{{width:8px;height:8px}}
-  ::-webkit-scrollbar-thumb{{background:rgba(255,255,255,.12);border-radius:99px}}
-  * {{ box-shadow: none !important; }}
-  .copy-btn svg{{transition:none}}
-  
-  .dynamic-card {{
-    background-color: var(--bg-card);
-    border-color: var(--border-color);
-    transition: background-color 0.3s ease, border-color 0.3s ease;
-  }}
-  .dynamic-card:hover {{
-    background-color: var(--bg-card-hover);
-  }}
-  .sub-box {{
-    background-color: var(--bg-sub-card);
-  }}
-  /* Aurora accents */
-  .aurora-card {{ position: relative; overflow: hidden; }}
-  .aurora-card::before {{
-    content: ''; position: absolute; inset: 0 0 auto 0; height: 2px;
-    background: linear-gradient(90deg, #0d9488, #2dd4bf, #4ade80, #8b5cf6, #d946ef, #0d9488);
-    background-size: 200% 100%; animation: auroraSlide 8s linear infinite;
-  }}
-  @keyframes auroraSlide {{ to {{ background-position: 200% 0; }} }}
-  .qc-btn {{
-    display: flex; align-items: center; justify-content: center; gap: 6px;
-    padding: 12px 10px; border-radius: 14px; font-size: 12px; font-weight: 800; color: #fff;
-    background: linear-gradient(135deg, #0d9488, #7c3aed); border: 0; cursor: pointer;
-    text-decoration: none; transition: transform .15s, filter .15s; -webkit-tap-highlight-color: transparent;
-  }}
-  .qc-btn:hover {{ filter: brightness(1.1); }}
-  .qc-btn:active {{ transform: scale(.97); }}
-  .qc-btn.alt {{ background: rgba(255,255,255,.07); border: 1px solid rgba(255,255,255,.14); }}
-  @media (prefers-reduced-motion: reduce) {{ .aurora-card::before {{ animation: none; }} }}
-</style>
-</head>
-<body class="font-vazir text-slate-100 antialiased min-h-screen py-8 px-3 sm:px-4 md:py-14">
-
-<div class="w-full max-w-4xl mx-auto space-y-5 sm:space-y-6 md:space-y-8">
-
-  <!-- Top Bar Theme Toggle Button -->
-  <div class="flex justify-end">
-    <button type="button" onclick="toggleTheme()" class="inline-flex items-center gap-1.5 px-4 py-2 rounded-full text-xs font-extrabold text-amber-300 border border-amber-400/30 bg-amber-400/10 hover:bg-amber-400/20 transition-colors shadow-lg">
-      <svg id="themeIcon" xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
-      تغییر تم
-    </button>
-  </div>
-
-  <!-- Hero -->
-  <section class="aurora-card rounded-[26px] sm:rounded-[28px] border dynamic-card backdrop-blur-2xl p-5 sm:p-6 md:p-8">
-    <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-5">
-      <div class="flex items-center gap-4">
-        <div class="w-13 h-13 sm:w-14 sm:h-14 shrink-0 rounded-2xl grid place-items-center bg-gradient-to-br from-blue-400/20 to-purple-400/10 border border-blue-400/25 text-blue-300">
-          <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l8 4v6c0 5.2-3.4 9-8 10-4.6-1-8-4.8-8-10V6l8-4z"/><path d="M9.5 12l1.8 1.8L15 10"/></svg>
-        </div>
-        <div class="min-w-0">
-          <h1 class="text-lg sm:text-xl md:text-2xl font-black tracking-tight truncate">{label_escaped}</h1>
-          <p class="mt-1.5 text-[10.5px] sm:text-[11px] text-white/40 break-all">UUID: {uid_escaped}</p>
-        </div>
-      </div>
-      <div class="flex items-center gap-2.5 self-start md:self-auto flex-wrap">
-        <button type="button" onclick="openQrModal()" class="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-full text-xs font-extrabold text-purple-300 border border-purple-400/30 bg-purple-400/10 hover:bg-purple-400/20 transition-colors">
-          <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
-          QR Code
-        </button>
-        <div class="inline-flex items-center gap-2 px-4 py-2 rounded-full text-xs font-extrabold {status_badge_html}">
-          <span class="status-dot w-2 h-2 rounded-full bg-current"></span>
-          {status_text}
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- Quick connect -->
-  <section class="rounded-[22px] border dynamic-card backdrop-blur-2xl p-5 sm:p-6">
-    <p class="text-sm font-black">اتصال سریع</p>
-    <p class="mt-1 text-[11px] text-white/45">برنامه را نصب کرده‌اید؟ با یک لمس، ساب به برنامه اضافه می‌شود.</p>
-    <div class="mt-4 grid grid-cols-2 sm:grid-cols-4 gap-3">
-      <a class="qc-btn" href="{deeplink_v2rayng}">v2rayNG</a>
-      <a class="qc-btn" href="{deeplink_hiddify}">Hiddify</a>
-      <a class="qc-btn" href="{deeplink_streisand}">Streisand</a>
-      <button id="subCopyTop" type="button" class="qc-btn alt" onclick="pxCopy('subLinkText','subCopyTop')"><span>کپی لینک ساب</span></button>
-    </div>
-  </section>
-
-  <!-- Usage overview -->
-  <section class="grid grid-cols-1 lg:grid-cols-[1.6fr_1fr] gap-5 sm:gap-6">
-
-    <div class="rounded-[22px] border dynamic-card backdrop-blur-2xl p-5 sm:p-6 md:p-7">
-      <div class="flex items-center gap-2.5">
-        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" class="text-white/35"><path d="M3 3v18h18"/><path d="M7 15l4-6 3 3 4-7"/></svg>
-        <div>
-          <p class="text-[10px] font-extrabold tracking-widest uppercase text-white/30">Traffic Overview</p>
-          <p class="mt-0.5 text-sm font-black">مصرف سرویس</p>
-        </div>
-      </div>
-
-      <div class="mt-6 flex flex-col sm:flex-row items-center sm:items-start gap-6">
-        <div class="relative shrink-0 w-[128px] h-[128px]">
-          <svg width="128" height="128" viewBox="0 0 132 132" class="-rotate-90">
-            <circle cx="66" cy="66" r="54" fill="none" stroke="rgba(255,255,255,0.07)" stroke-width="10"/>
-            <circle cx="66" cy="66" r="54" fill="none" stroke="url(#usageRingGradient)" stroke-width="10" stroke-linecap="round"
-              stroke-dasharray="339.29" stroke-dashoffset="{dash_calc_offset}"/>
-            <defs>
-              <linearGradient id="usageRingGradient" x1="0%" y1="0%" x2="100%" y2="100%">
-                <stop offset="0%" stop-color="#2dd4bf"/>
-                <stop offset="100%" stop-color="#a78bfa"/>
-              </linearGradient>
-            </defs>
-          </svg>
-          <div class="absolute inset-0 grid place-items-center">
-            <div class="text-center">
-              <p class="text-xl font-black leading-none">{usage_percent}%</p>
-              <p class="mt-1.5 text-[10px] text-white/40">مصرف‌شده</p>
-            </div>
-          </div>
-        </div>
-
-        <div class="flex-1 w-full min-w-0">
-          <div class="text-xl sm:text-2xl font-black tracking-tight">
-            {used_bytes_str}
-            <span class="text-sm font-semibold text-white/40"> / {limit_bytes_str}</span>
-          </div>
-
-          <div class="mt-4 rounded-xl border border-white/[0.05] sub-box px-3 pt-3 pb-1.5">
-            <p class="flex items-center gap-1.5 text-[10px] text-white/35 mb-1">
-              <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17l6-6 4 4 8-8"/><path d="M17 7h4v4"/></svg>
-              روند مصرف
-            </p>
-            <svg viewBox="0 0 300 64" class="w-full h-14" preserveAspectRatio="none">
-              <defs>
-                <linearGradient id="trendFill" x1="0" y1="0" x2="0" y2="1">
-                  <stop offset="0%" stop-color="#5eead4" stop-opacity="0.35"/>
-                  <stop offset="100%" stop-color="#5eead4" stop-opacity="0"/>
-                </linearGradient>
-              </defs>
-              <path d="M0,64 L{svg_points} L300,64 Z" fill="url(#trendFill)"/>
-              <path d="M{svg_points}" fill="none" stroke="#5eead4" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-          </div>
-
-          <div class="mt-4 flex items-center justify-between text-[11px] text-white/40 flex-wrap gap-2">
-            <span class="inline-flex items-center gap-1.5">
-              <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>
-              باقی‌مانده: <b class="text-white/70 font-bold">{remaining_value_escaped}</b>
-            </span>
-            <span class="inline-flex items-center gap-1.5">
-              <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 9h18M8 3v3M16 3v3"/></svg>
-              زمان: <b class="text-white/70 font-bold">{expiry_remaining_escaped}</b>
-            </span>
-
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <div class="rounded-[22px] border dynamic-card backdrop-blur-2xl p-5 sm:p-6 md:p-7">
-      <div class="flex items-center gap-2.5">
-        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" class="text-white/35"><circle cx="12" cy="12" r="9"/><path d="M12 8v4l3 2"/></svg>
-        <p class="text-[10px] font-extrabold tracking-widest uppercase text-white/30">Service</p>
-      </div>
-      <div class="mt-4 divide-y divide-white/[0.06]">
-        <div class="flex items-center justify-between py-3 first:pt-0">
-          <span class="inline-flex items-center gap-2 text-[11px] text-white/45">
-            <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 9h18M8 3v3M16 3v3"/></svg>
-            انقضا
-          </span>
-          <span class="text-xs font-extrabold">{expiry_display_escaped}</span>
-        </div>
-        <div class="flex items-center justify-between py-3">
-          <span class="inline-flex items-center gap-2 text-[11px] text-white/45">
-            <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.55a11 11 0 0 1 14 0"/><path d="M8.5 16a6 6 0 0 1 7 0"/><path d="M12 20h.01"/></svg>
-            IP Limit
-          </span>
-          <span class="text-xs font-extrabold">{ip_limit_escaped}</span>
-        </div>
-        <div class="flex items-center justify-between py-3">
-          <span class="inline-flex items-center gap-2 text-[11px] text-white/45">
-            <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V7a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v2"/><rect x="2" y="9" width="20" height="8" rx="2"/><path d="M6 17v2M18 17v2"/></svg>
-            Connection
-          </span>
-          <span class="text-xs font-extrabold">{connection_limit_escaped}</span>
-        </div>
-        <div class="flex items-center justify-between py-3 last:pb-0">
-          <span class="inline-flex items-center gap-2 text-[11px] text-white/45">
-            <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"/></svg>
-            Speed
-          </span>
-          <span class="text-xs font-extrabold">{speed_limit_escaped}</span>
-        </div>
-      </div>
-    </div>
-
-  </section>
-
-  <!-- Stats -->
-  <section class="grid grid-cols-2 md:grid-cols-4 gap-3.5 sm:gap-4 md:gap-5">
-
-    <div class="rounded-2xl border dynamic-card backdrop-blur-xl p-4 sm:p-5 hover:border-emerald-400/20 transition-colors duration-200">
-      <div class="w-9 h-9 rounded-xl grid place-items-center bg-emerald-400/10 border border-emerald-400/20 text-emerald-300">
-        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M18 9l-5 5-3-3-4 4"/></svg>
-      </div>
-      <p class="mt-4 text-[11px] text-white/45">مصرف فعلی</p>
-      <p class="mt-1 text-[14px] sm:text-[15px] font-black text-emerald-300 break-words">{used_bytes_str}</p>
-    </div>
-
-    <div class="rounded-2xl border dynamic-card backdrop-blur-xl p-4 sm:p-5 hover:border-amber-400/20 transition-colors duration-200">
-      <div class="w-9 h-9 rounded-xl grid place-items-center bg-amber-400/10 border border-amber-400/20 text-amber-300">
-        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>
-      </div>
-      <p class="mt-4 text-[11px] text-white/45">باقی‌مانده</p>
-      <p class="mt-1 text-[14px] sm:text-[15px] font-black text-amber-300 break-words">{remaining_value_escaped}</p>
-    </div>
-
-    <div class="rounded-2xl border dynamic-card backdrop-blur-xl p-4 sm:p-5 hover:border-blue-400/20 transition-colors duration-200">
-      <div class="w-9 h-9 rounded-xl grid place-items-center bg-blue-400/10 border border-blue-400/20 text-blue-300">
-        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M9 4v16M4 9h16"/></svg>
-      </div>
-      <p class="mt-4 text-[11px] text-white/45">اتصالات فعال</p>
-      <p class="mt-1 text-[14px] sm:text-[15px] font-black text-blue-300 break-words">{len(unique_ips_for_uuid(uid))}</p>
-    </div>
-
-    <div class="rounded-2xl border dynamic-card backdrop-blur-xl p-4 sm:p-5 hover:border-purple-400/20 transition-colors duration-200">
-      <div class="w-9 h-9 rounded-xl grid place-items-center bg-purple-400/10 border border-purple-400/20 text-purple-300">
-        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l9 4.5v6c0 5-3.6 8.7-9 9.5-5.4-.8-9-4.5-9-9.5v-6L12 2z"/></svg>
-      </div>
-      <p class="mt-4 text-[11px] text-white/45">زمان باقی‌مانده</p>
-      <p class="mt-1 text-[14px] sm:text-[15px] font-black text-purple-300 break-words">{expiry_remaining_escaped}</p>
-    </div>
-
-  </section>
-
-  <!-- Technical details -->
-  <section class="rounded-[22px] border dynamic-card backdrop-blur-2xl p-5 sm:p-6 md:p-7">
-    <div class="flex items-center justify-between gap-3 mb-5">
-      <p class="flex items-center gap-2 text-sm font-black">
-        <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" class="text-white/40"><path d="M4 21v-7M4 10V3M12 21v-11M12 6V3M20 21v-5M20 12V3"/><path d="M1 14h6M9 8h6M17 16h6"/></svg>
-        جزئیات فنی
-      </p>
-      <p class="text-[11px] text-white/40">Configuration Details</p>
-    </div>
-    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
-      <div class="rounded-2xl border border-white/[0.06] sub-box p-4">
-        <p class="text-[11px] text-white/45">Protocol</p>
-        <p class="mt-2 text-[11px] font-medium text-purple-300 tracking-wide" dir="ltr" style="font-family:ui-monospace,Consolas,monospace">{protocol_escaped}</p>
-      </div>
-      <div class="rounded-2xl border border-white/[0.06] sub-box p-4">
-        <p class="text-[11px] text-white/45">Fingerprint</p>
-        <p class="mt-2 text-[11px] font-medium text-purple-300 tracking-wide" dir="ltr" style="font-family:ui-monospace,Consolas,monospace">{fingerprint_escaped}</p>
-      </div>
-      <div class="rounded-2xl border border-white/[0.06] sub-box p-4">
-        <p class="text-[11px] text-white/45">IP Limit</p>
-        <p class="mt-2 text-xs font-bold text-white/85">{ip_limit_escaped}</p>
-      </div>
-      <div class="rounded-2xl border border-white/[0.06] sub-box p-4">
-        <p class="text-[11px] text-white/45">Connection Limit</p>
-        <p class="mt-2 text-xs font-bold text-white/85">{connection_limit_escaped}</p>
-      </div>
-      <div class="rounded-2xl border border-white/[0.06] sub-box p-4">
-        <p class="text-[11px] text-white/45">Speed Limit</p>
-        <p class="mt-2 text-xs font-bold text-white/85">{speed_limit_escaped}</p>
-      </div>
-      <div class="rounded-2xl border border-white/[0.06] sub-box p-4">
-        <p class="text-[11px] text-white/45">تاریخ انقضا</p>
-        <p class="mt-2 text-xs font-bold text-white/85">{expiry_display_escaped}</p>
-      </div>
-    </div>
-  </section>
-
-  <!-- Links -->
-  <section class="rounded-[22px] border dynamic-card backdrop-blur-2xl p-5 sm:p-6 md:p-7">
-    <div class="flex items-center justify-between gap-3 mb-5">
-      <p class="flex items-center gap-2 text-sm font-black">
-        <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" class="text-white/40"><path d="M10 13a5 5 0 0 0 7.07 0l2.83-2.83a5 5 0 0 0-7.07-7.07L11.5 4.5"/><path d="M14 11a5 5 0 0 0-7.07 0l-2.83 2.83a5 5 0 0 0 7.07 7.07l1.41-1.41"/></svg>
-        لینک‌های سرویس
-      </p>
-      <p class="text-[11px] text-white/40">Copy / Import</p>
-    </div>
-
-    <div class="space-y-3">
-      <div class="flex flex-col sm:flex-row sm:items-center gap-3 sm:gap-4 rounded-2xl border border-white/[0.06] sub-box p-4 hover:border-purple-400/25 transition-colors duration-200">
-        <div class="min-w-0 flex-1">
-          <p class="text-[11px] font-extrabold text-white/45 tracking-wide">VLESS</p>
-          <p id="vlessLinkText" class="mt-1.5 text-[11px] text-purple-300 break-all leading-6" dir="ltr" style="font-family:ui-monospace,Consolas,monospace">{vless_url_escaped}</p>
-        </div>
-        <button id="vlessCopyBtn" type="button" onclick="pxCopy('vlessLinkText','vlessCopyBtn')"
-          class="copy-btn shrink-0 self-start sm:self-center inline-flex items-center gap-1.5 text-[11px] font-bold text-white/60 px-3.5 py-2 rounded-xl bg-white/[0.05] border border-white/10 hover:bg-white/[0.1] hover:text-white transition-colors duration-200">
-          <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
-          <span>کپی</span>
-        </button>
-      </div>
-
-      <div class="flex flex-col sm:flex-row sm:items-center gap-3 sm:gap-4 rounded-2xl border border-white/[0.06] sub-box p-4 hover:border-purple-400/25 transition-colors duration-200">
-        <div class="min-w-0 flex-1">
-          <p class="text-[11px] font-extrabold text-white/45 tracking-wide">SUBSCRIPTION</p>
-          <p id="subLinkText" class="mt-1.5 text-[11px] text-purple-300 break-all leading-6" dir="ltr" style="font-family:ui-monospace,Consolas,monospace">{sub_url_escaped}</p>
-        </div>
-        <button id="subCopyBtn" type="button" onclick="pxCopy('subLinkText','subCopyBtn')"
-          class="copy-btn shrink-0 self-start sm:self-center inline-flex items-center gap-1.5 text-[11px] font-bold text-white/60 px-3.5 py-2 rounded-xl bg-white/[0.05] border border-white/10 hover:bg-white/[0.1] hover:text-white transition-colors duration-200">
-          <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
-          <span>کپی</span>
-        </button>
-      </div>
-    </div>
-  </section>
-
-  <!-- Downloads -->
-  <section class="rounded-[22px] border dynamic-card backdrop-blur-2xl p-5 sm:p-6 md:p-7">
-    <div class="flex items-center justify-between gap-3 mb-5">
-      <p class="flex items-center gap-2 text-sm font-black">
-        <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" class="text-white/40"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>
-        دانلود برنامه‌ها
-      </p>
-      <p class="text-[11px] text-white/40">Official Releases</p>
-    </div>
-
-    <div class="grid grid-cols-1 sm:grid-cols-3 gap-3.5">
-      <a href="https://github.com/2dust/v2rayNG/releases/latest" target="_blank" rel="noopener noreferrer"
-         class="flex items-center gap-3 rounded-2xl border border-white/10 sub-box p-4 hover:border-blue-400/25 transition-colors duration-200">
-        <div class="w-10 h-10 shrink-0 rounded-xl grid place-items-center bg-blue-400/10 border border-blue-400/20 text-blue-300 font-black text-[11px]">NG</div>
-        <div class="min-w-0">
-          <p class="text-xs font-extrabold">v2rayNG</p>
-          <p class="mt-0.5 text-[10px] text-white/40">Android</p>
-        </div>
-      </a>
-      <a href="https://github.com/2dust/v2rayN/releases/latest" target="_blank" rel="noopener noreferrer"
-         class="flex items-center gap-3 rounded-2xl border border-white/10 sub-box p-4 hover:border-blue-400/25 transition-colors duration-200">
-        <div class="w-10 h-10 shrink-0 rounded-xl grid place-items-center bg-blue-400/10 border border-blue-400/20 text-blue-300 font-black text-[11px]">N</div>
-        <div class="min-w-0">
-          <p class="text-xs font-extrabold">v2rayN</p>
-          <p class="mt-0.5 text-[10px] text-white/40">Windows / macOS / Linux</p>
-        </div>
-      </a>
-      <a href="https://github.com/hiddify/hiddify-app/releases/latest" target="_blank" rel="noopener noreferrer"
-         class="flex items-center gap-3 rounded-2xl border border-white/10 sub-box p-4 hover:border-blue-400/25 transition-colors duration-200">
-        <div class="w-10 h-10 shrink-0 rounded-xl grid place-items-center bg-blue-400/10 border border-blue-400/20 text-blue-300 font-black text-[11px]">H</div>
-        <div class="min-w-0">
-          <p class="text-xs font-extrabold">Hiddify</p>
-          <p class="mt-0.5 text-[10px] text-white/40">Android / Windows / macOS / Linux</p>
-        </div>
-      </a>
-    </div>
-  </section>
-
-
-</div>
-
-<div class="h-20 sm:hidden"></div>
-<div class="fixed bottom-0 inset-x-0 z-40 sm:hidden px-3" style="padding-bottom:max(12px,env(safe-area-inset-bottom))">
-  <div class="flex gap-2 rounded-2xl border border-white/10 p-2 backdrop-blur-xl" style="background:rgba(5,11,20,.85)">
-    <button id="subCopyBar" type="button" class="qc-btn flex-1" onclick="pxCopy('subLinkText','subCopyBar')"><span>کپی لینک ساب</span></button>
-    <button type="button" class="qc-btn alt" onclick="openQrModal()" style="min-width:64px">QR</button>
-  </div>
-</div>
-
-<!-- QR Code Modal Popup -->
-<div id="qrModal" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md hidden">
-  <div class="w-full max-w-sm rounded-[24px] border border-white/15 bg-[#0b0c14] p-6 text-center shadow-2xl relative">
-    <button type="button" onclick="closeQrModal()" class="absolute top-4 left-4 w-8 h-8 rounded-full bg-white/5 border border-white/10 grid place-items-center text-white/60 hover:text-white"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
-    <p class="text-sm font-black text-white/90 mb-2">QR Code اسکن کانفیگ</p>
-    <p class="text-[11px] text-white/40 mb-4">برای اتصال سریع با گوشی موبایل</p>
-    <div id="qrcodeContainer" class="bg-white p-4 rounded-2xl inline-block mx-auto mb-4 border border-white/10"></div>
-    <p id="qrModalText" class="text-[10px] text-purple-300 break-all max-h-16 overflow-y-auto px-2" dir="ltr"></p>
-  </div>
-</div>
-
-<script>
-const vlessUrlData = "{vless_url}";
-
-// Theme toggle logic with localStorage support (2 themes total)
-function toggleTheme() {{
-  const body = document.body;
-  body.classList.toggle('theme-lighter');
-  const isLighter = body.classList.contains('theme-lighter');
-  localStorage.setItem('px_theme', isLighter ? 'lighter' : 'dark');
-}}
-
-// Initialize saved theme on load
-(function() {{
-  if (localStorage.getItem('px_theme') === 'lighter') {{
-    document.body.classList.add('theme-lighter');
-  }}
-}})();
-
-function openQrModal() {{
-  var modal = document.getElementById('qrModal');
-  var container = document.getElementById('qrcodeContainer');
-  var txtEl = document.getElementById('qrModalText');
-  container.innerHTML = "";
-  txtEl.textContent = vlessUrlData;
-  modal.classList.remove('hidden');
-  try {{
-    var typeNumber = 0;
-    var errorCorrectionLevel = 'L';
-    var qr = qrcode(typeNumber, errorCorrectionLevel);
-    qr.addData(vlessUrlData);
-    qr.make();
-    container.innerHTML = qr.createImgTag(5, 8);
-  }} catch (e) {{
-    container.innerHTML = "<p class='text-xs text-black'>خطا در تولید QR Code</p>";
-  }}
-}}
-
-function closeQrModal() {{
-  document.getElementById('qrModal').classList.add('hidden');
-}}
-
-document.getElementById('qrModal').addEventListener('click', function(e) {{
-  if (e.target === this) closeQrModal();
-}});
-
-function pxCopy(textId, btnId) {{
-  var el = document.getElementById(textId);
-  var btn = document.getElementById(btnId);
-  if (!el || !btn) return;
-  var text = el.textContent.textContext || el.textContent.trim();
-  var done = function() {{
-    var original = btn.getAttribute('data-original');
-    if (!original) {{
-      original = btn.innerHTML;
-      btn.setAttribute('data-original', original);
-    }}
-    btn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg><span>کپی شد</span>';
-    btn.classList.add('text-emerald-300','border-emerald-400/30','bg-emerald-400/10');
-    setTimeout(function() {{
-      btn.innerHTML = original;
-      btn.classList.remove('text-emerald-300','border-emerald-400/30','bg-emerald-400/10');
-    }}, 1700);
-  }};
-  if (navigator.clipboard && navigator.clipboard.writeText) {{
-    navigator.clipboard.writeText(text).then(done).catch(function() {{ fallbackCopy(text, done); }});
-  }} else {{
-    fallbackCopy(text, done);
-  }}
-}}
-function fallbackCopy(text, cb) {{
-  var ta = document.createElement('textarea');
-  ta.value = text;
-  ta.style.position = 'fixed';
-  ta.style.opacity = '0';
-  document.body.appendChild(ta);
-  ta.select();
-  try {{ document.execCommand('copy'); }} catch (e) {{}}
-  document.body.removeChild(ta);
-  if (cb) cb();
-}}
-</script>
-</body>
-</html>"""
-    return HTMLResponse(info_html)
+    html_out = render_info({
+        "name": name,
+        "uid": uid,
+        "state": state,
+        "state_text": state_text,
+        "protocol": proto_label,
+        "fingerprint": snapshot.get("fingerprint", "chrome"),
+        "used": fmt_bytes(used),
+        "limit": fmt_bytes(limit) if limit > 0 else None,
+        "remaining": remaining_value,
+        "percent": percent,
+        "trend": svg_points,
+        "time_left": time_left,
+        "time_pct": time_pct,
+        "time_warn": time_warn,
+        "expiry": expiry_text,
+        "connections": len(unique_ips_for_uuid(uid)),
+        "ip_limit": "نامحدود" if not snapshot.get("ip_limit", 0) else str(snapshot.get("ip_limit")),
+        "conn_limit": "نامحدود" if not snapshot.get("connection_limit", 0) else str(snapshot.get("connection_limit")),
+        "speed": "نامحدود" if not snapshot.get("speed_limit_bytes", 0) else fmt_bytes(snapshot.get("speed_limit_bytes", 0)) + "/s",
+        "configs": configs,
+        "sub_url": sub_url,
+        "links": {
+            "v2rayng": f"v2rayng://install-sub?url={_sub_q}&name={_name_q}",
+            "hiddify": f"hiddify://import/{sub_url}#{_name_q}",
+            "streisand": f"streisand://import/{sub_url}",
+        },
+    })
+    return HTMLResponse(html_out, headers={"Cache-Control": "no-store"})
 # ============================================================
 # SUB GROUP API
 # ============================================================
@@ -5317,147 +4845,6 @@ async def sub_group_subscription(
 # PUBLIC GROUP
 # ============================================================
 
-PUBLIC_SUB_HTML = r"""
-<!DOCTYPE html>
-<html lang="fa" dir="rtl">
-
-<head>
-<meta charset="UTF-8">
-
-<meta
-name="viewport"
-content="width=device-width,initial-scale=1"
->
-
-<title>
-Aurora Panel
-</title>
-
-<style>
-
-*{
-    box-sizing:border-box;
-}
-
-body{
-    margin:0;
-    min-height:100vh;
-
-    display:flex;
-    justify-content:center;
-    align-items:center;
-
-    padding:20px;
-
-    font-family:Arial,sans-serif;
-
-    color:#fff;
-
-    background:
-        radial-gradient(
-            circle at top right,
-            rgba(13,148,136,.17),
-            transparent 30%
-        ),
-        #07070a;
-}
-
-.card{
-    width:100%;
-    max-width:560px;
-
-    padding:28px;
-    border-radius:25px;
-
-    background:rgba(255,255,255,.045);
-
-    border:
-        1px solid
-        rgba(255,255,255,.08);
-
-    backdrop-filter:blur(25px);
-}
-
-h1{
-    margin-top:0;
-}
-
-.text{
-    color:rgba(255,255,255,.55);
-    line-height:2;
-    font-size:13px;
-}
-
-.url{
-    margin-top:20px;
-    padding:14px;
-
-    border-radius:13px;
-
-    background:rgba(0,0,0,.22);
-
-    color:#93c5fd;
-
-    direction:ltr;
-    word-break:break-all;
-
-    font-family:Consolas,monospace;
-}
-
-.support{
-    display:inline-block;
-    margin-top:18px;
-
-    color:#5eead4;
-    text-decoration:none;
-}
-
-.version{
-    color:#5eead4;
-    font-size:11px;
-}
-
-</style>
-</head>
-
-<body>
-
-<div class="card">
-
-<h1>
-Aurora Panel
-</h1>
-
-<div class="text">
-اشتراک شما آماده است.
-</div>
-
-<div
-class="url"
-id="subUrl"
-></div>
-
-
-</div>
-
-<script>
-
-const url =
-    location.origin +
-    location.pathname.replace(
-        "/p/",
-        "/sub-group/"
-    );
-
-document.getElementById(
-    "subUrl"
-).textContent = url;
-
-</script>
-
-</body>
-</html>
-"""
 
 
 @app.get(
@@ -5493,8 +4880,42 @@ async def public_sub_page(
             status_code=404,
         )
 
-    return HTMLResponse(
-        PUBLIC_SUB_HTML
+    return HTMLResponse(render_group_page(), headers={"Cache-Control": "no-store"})
+
+
+QR_LIB_URL = "https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"
+_QR_LIB: dict = {"data": None}
+
+
+@app.get("/_qr.js")
+async def qr_library():
+    """Serve the QR library from this panel (fetched once and cached) so the sub page
+    does not depend on a CDN that may be blocked for the visitor."""
+    cache_file = DATA_DIR / "qrcode.min.js"
+    if _QR_LIB["data"] is None:
+        try:
+            if cache_file.exists():
+                _QR_LIB["data"] = cache_file.read_bytes()
+        except Exception:
+            pass
+    if _QR_LIB["data"] is None and http_client is not None:
+        try:
+            r = await http_client.get(QR_LIB_URL)
+            if r.status_code == 200 and b"qrcode" in r.content and len(r.content) > 2000:
+                _QR_LIB["data"] = r.content
+                try:
+                    DATA_DIR.mkdir(parents=True, exist_ok=True)
+                    cache_file.write_bytes(r.content)
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.warning("QR library fetch failed: %s", exc)
+    if not _QR_LIB["data"]:
+        return Response("/* qr unavailable */", status_code=404, media_type="application/javascript")
+    return Response(
+        _QR_LIB["data"],
+        media_type="application/javascript; charset=utf-8",
+        headers={"Cache-Control": "public, max-age=604800"},
     )
 
 
@@ -5728,9 +5149,6 @@ async def public_sub_data(
             fmt_bytes(
                 total_used
             ),
-
-        "support":
-            SUPPORT_USERNAME,
 
         "links":
             links_out,
@@ -6203,33 +5621,6 @@ except Exception as exc:
 
 
 # ============================================================
-# XHTTP
-# ============================================================
-
-try:
-
-    from xhttp_siz10 import (
-        router as xhttp_router
-    )
-
-    app.include_router(
-        xhttp_router
-    )
-
-    logger.info(
-        "XHTTP module loaded."
-    )
-
-except Exception as exc:
-
-    logger.warning(
-        "XHTTP module unavailable: %s",
-        exc,
-    )
-
-
-
-# ============================================================
 
 @app.get("/api/me")
 async def api_me_info(request: Request, token=Depends(require_auth)):
@@ -6422,7 +5813,7 @@ async def backup_users(token=Depends(require_auth)):
         if not (meta.get("permissions") or {}).get("settings"):
             raise HTTPException(403, detail="دسترسی ندارید")
     payload = {
-        "type": "pxpanel_users_backup",
+        "type": "aurora_users_backup",
         "version": APP_VERSION,
         "created_at": datetime.now().isoformat(),
         "links": dict(LINKS),
@@ -6435,7 +5826,7 @@ async def backup_users(token=Depends(require_auth)):
         content=body,
         media_type="application/json",
         headers={
-            "Content-Disposition": f'attachment; filename="pxpanel-users-{datetime.now().strftime("%Y%m%d-%H%M%S")}.json"'
+            "Content-Disposition": f'attachment; filename="aurora-users-{datetime.now().strftime("%Y%m%d-%H%M%S")}.json"'
         },
     )
 
@@ -6453,7 +5844,7 @@ async def backup_bot(token=Depends(require_auth)):
     except Exception:
         data = {}
     payload = {
-        "type": "pxpanel_bot_backup",
+        "type": "aurora_bot_backup",
         "version": APP_VERSION,
         "created_at": datetime.now().isoformat(),
         "telegram": data,
@@ -6463,7 +5854,7 @@ async def backup_bot(token=Depends(require_auth)):
         content=body,
         media_type="application/json",
         headers={
-            "Content-Disposition": f'attachment; filename="pxpanel-bot-{datetime.now().strftime("%Y%m%d-%H%M%S")}.json"'
+            "Content-Disposition": f'attachment; filename="aurora-bot-{datetime.now().strftime("%Y%m%d-%H%M%S")}.json"'
         },
     )
 
@@ -6481,7 +5872,7 @@ async def restore_users(request: Request, token=Depends(require_auth)):
         raise HTTPException(400, detail="فرمت نامعتبر")
     # accept either wrapper or raw state
     links = body.get("links")
-    if links is None and body.get("type") == "pxpanel_users_backup":
+    if links is None and body.get("type") in ("aurora_users_backup", "pxpanel_users_backup"):
         raise HTTPException(400, detail="لینک‌ها در بک‌آپ نیست")
     if links is None:
         raise HTTPException(400, detail="فایل بک‌آپ کاربران نیست")
@@ -6949,7 +6340,6 @@ tr:hover td{background:var(--hover)}
 
 .field{margin-bottom:14px}
 .entry-row{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:10px;border:1px solid var(--card-b);border-radius:12px;margin-bottom:8px;background:var(--bg3)}
-.entry-row .er-proto{grid-column:1 / -1}
 .entry-row .er-del{grid-column:1 / -1;justify-self:end}
 .hint{font-size:11px;color:var(--t3);line-height:1.8;margin:2px 0 10px}
 .entry-actions{display:flex;gap:8px;flex-wrap:wrap}
@@ -7063,7 +6453,7 @@ tr:hover td{background:var(--hover)}
     <div class="nav-sec" data-i18n="sec_sys">سیستـم</div>
     <button class="nav-item" data-page="telegram" data-perm="telegram">
       <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><path d="M12 0C5.37 0 0 5.37 0 12s5.37 12 12 12 12-5.37 12-12S18.63 0 12 0zm5.56 8.2-1.86 8.77c-.14.62-.5.77-1.01.48l-2.8-2.06-1.35 1.3c-.15.15-.27.27-.55.27l.2-2.84 5.18-4.68c.22-.2-.05-.31-.35-.12l-6.4 4.03-2.76-.86c-.6-.19-.61-.6.12-.89l10.78-4.16c.5-.18.94.12.78.86z"/></svg>
-      <span class="nav-label" data-i18n="nav_telegram">پی ایکس بات</span>
+      <span class="nav-label" data-i18n="nav_telegram">ربات آرورا</span>
     </button>
     <button class="nav-item" data-page="news" data-perm="news">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 22h16a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2H8a2 2 0 0 0-2 2v16a2 2 0 0 1-2 2Zm0 0a2 2 0 0 1-2-2v-9c0-1.1.9-2 2-2h2"/><path d="M18 14h-8M15 18h-5M10 6h8v4h-8V6Z"/></svg>
@@ -7190,12 +6580,11 @@ tr:hover td{background:var(--hover)}
         <div class="field"><label data-i18n="label_days">انقضـا (روز)</label><input id="cDays" type="number" value="0" min="0"></div>
       </div>
       <div class="field"><label>نام کانفیگ‌ها در ساب (هر خط یک نام، اختیاری)</label><textarea id="cNames" rows="3" placeholder="Config 1&#10;Config 2"></textarea></div>
-      <div class="field"><label>پروتکل‌های چندگانه در ساب (اختیاری)</label>
-        <p class="hint">هر ردیف یک کانفیگ جدا در ساب می‌سازد. «آدرس» همان جایی است که برنامه به آن وصل می‌شود (آی‌پی یا دامنه)؛ اگر روی یک شبکه کار نکرد، آدرس دیگری وارد کنید. خالی بماند یعنی دامنه پنل. SNI/Host را معمولاً خالی بگذارید. با داشتن ردیف، «تعداد کانفیگ» نادیده گرفته می‌شود.</p>
+      <div class="field"><label>کانفیگ‌های چندآدرسه در ساب (اختیاری)</label>
+        <p class="hint">هر ردیف یک کانفیگ جدا در ساب می‌سازد. «آدرس» همان جایی است که برنامه به آن وصل می‌شود (آی‌پی یا دامنه)؛ اگر روی یک شبکه کار نکرد، آدرس دیگری وارد کنید. SNI/Host را معمولاً خالی بگذارید. با داشتن ردیف، «تعداد کانفیگ» نادیده گرفته می‌شود.</p>
         <div id="cEntries"></div>
         <div class="entry-actions">
-          <button type="button" class="btn btn-sm" onclick="addEntryRow('cEntries')"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg><span>افزودن پروتکل</span></button>
-          <button type="button" class="btn btn-sm" onclick="addAllEntryRows('cEntries')"><span>هر ۴ نوع</span></button>
+          <button type="button" class="btn btn-sm" onclick="addEntryRow('cEntries')"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg><span>افزودن آدرس</span></button>
         </div>
       </div>
       <div class="form-row">
@@ -7299,9 +6688,9 @@ tr:hover td{background:var(--hover)}
   </div>
   
   <div class="card">
-    <div class="card-title">نام پیش‌فرض کانفیگ</div>
-    <p class="hint">وقتی هنگام ساخت نام را خالی بگذارید، از این نام استفاده می‌شود. مثال: <b dir="ltr">Aurora</b> می‌شود Aurora-1، Aurora-2، ... یا با <b dir="ltr">Aurora {n}</b> جای شماره را خودتان تعیین کنید. متغیرهایی مثل <b dir="ltr">{protocol}</b> هم کار می‌کنند (در ساب با نوع پروتکل هر کانفیگ پر می‌شود).</p>
-    <div class="field"><input id="sDefaultName" maxlength="40" placeholder="Aurora"></div>
+    <div class="card-title">نام پیش‌فرض کانفیگ‌ها (داخل ساب)</div>
+    <p class="hint">این نام برای هر کانفیگ داخل ساب استفاده می‌شود، مگر اینکه برای همان لینک نام جداگانه نوشته باشید. نام خود ساب (نام لینک) جداست و تغییری نمی‌کند. اگر چند کانفیگ در ساب باشد و نام شماره نداشته باشد، شماره خودکار اضافه می‌شود. متغیرها: <b dir="ltr">{protocol}</b> <b dir="ltr">{i}</b> <b dir="ltr">{address}</b> <b dir="ltr">{port}</b></p>
+    <div class="field"><input id="sDefaultName" maxlength="80" placeholder="Netherlands - {protocol}"></div>
     <div id="sDefaultNext" class="hint"></div>
     <button class="btn btn-p" onclick="saveDefaultName()"><span data-i18n="btn_save">ذخیـره</span></button>
   </div>
@@ -7438,7 +6827,7 @@ tr:hover td{background:var(--hover)}
     <div>
       <div class="page-title">
         <svg viewBox="0 0 24 24" fill="currentColor" width="22" height="22"><path d="M12 0C5.37 0 0 5.37 0 12s5.37 12 12 12 12-5.37 12-12S18.63 0 12 0zm5.56 8.2-1.86 8.77c-.14.62-.5.77-1.01.48l-2.8-2.06-1.35 1.3c-.15.15-.27.27-.55.27l.2-2.84 5.18-4.68c.22-.2-.05-.31-.35-.12l-6.4 4.03-2.76-.86c-.6-.19-.61-.6.12-.89l10.78-4.16c.5-.18.94.12.78.86z"/></svg>
-        <span data-i18n="nav_telegram">پی ایکس بات</span>
+        <span data-i18n="nav_telegram">ربات آرورا</span>
       </div>
       <div class="page-sub" data-i18n="tg_sub">توکن ربات و آیدی عددی ادمین · فعال‌سازی خودکار و وب‌هوک</div>
     </div>
@@ -7498,12 +6887,11 @@ tr:hover td{background:var(--hover)}
     <div class="field"><label>نام کانفیگ / ساب</label><input id="eLabel" maxlength="60"><p class="hint" style="margin-top:8px">متغیرها: <b dir="ltr">{protocol}</b> نوع پروتکل (مثلاً Web Socket)، <b dir="ltr">{i}</b> شماره کانفیگ در ساب، <b dir="ltr">{address}</b> آدرس، <b dir="ltr">{port}</b> پورت. مثال: <b dir="ltr">Netherlands - {protocol}</b> (هر نویسه‌ای از جمله پرچم هم مجاز است)</p></div>
     <div class="field"><label>تعداد کانفیگ در ساب (۱–۴۰)</label><input id="eCount" type="number" min="1" max="40" value="1"></div>
     <div class="field"><label>نام کانفیگ‌ها در ساب (هر خط یک نام، اختیاری)</label><textarea id="eNames" rows="4" placeholder="Config 1&#10;Config 2"></textarea></div>
-      <div class="field"><label>پروتکل‌های چندگانه در ساب (اختیاری)</label>
-        <p class="hint">هر ردیف یک کانفیگ جدا در ساب می‌سازد. «آدرس» همان جایی است که برنامه به آن وصل می‌شود (آی‌پی یا دامنه)؛ اگر روی یک شبکه کار نکرد، آدرس دیگری وارد کنید. خالی بماند یعنی دامنه پنل. SNI/Host را معمولاً خالی بگذارید. با داشتن ردیف، «تعداد کانفیگ» نادیده گرفته می‌شود.</p>
+      <div class="field"><label>کانفیگ‌های چندآدرسه در ساب (اختیاری)</label>
+        <p class="hint">هر ردیف یک کانفیگ جدا در ساب می‌سازد. «آدرس» همان جایی است که برنامه به آن وصل می‌شود (آی‌پی یا دامنه)؛ اگر روی یک شبکه کار نکرد، آدرس دیگری وارد کنید. SNI/Host را معمولاً خالی بگذارید. با داشتن ردیف، «تعداد کانفیگ» نادیده گرفته می‌شود.</p>
         <div id="eEntries"></div>
         <div class="entry-actions">
-          <button type="button" class="btn btn-sm" onclick="addEntryRow('eEntries')"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg><span>افزودن پروتکل</span></button>
-          <button type="button" class="btn btn-sm" onclick="addAllEntryRows('eEntries')"><span>هر ۴ نوع</span></button>
+          <button type="button" class="btn btn-sm" onclick="addEntryRow('eEntries')"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg><span>افزودن آدرس</span></button>
         </div>
       </div>
     <div class="modal-actions">
@@ -7836,12 +7224,9 @@ function randomName(){
   if(/^[0-9]/.test(s)) s='a'+s.slice(1);
   document.getElementById('cName').value=s;
 }
-const ENTRY_PROTOS=[['vless-ws','VLESS WebSocket'],['xhttp-packet-up','XHTTP Packet Up'],['xhttp-stream-up','XHTTP Stream Up'],['xhttp-stream-one','XHTTP Stream One']];
 function entryRowHtml(e){
   e=e||{};
-  const opts=ENTRY_PROTOS.map(([v,l])=>`<option value="${v}" ${e.protocol===v?'selected':''}>${l}</option>`).join('');
   return `<div class="entry-row">
-    <select class="er-proto">${opts}</select>
     <input class="er-addr" dir="ltr" placeholder="Address / DNS (IP or domain)" value="${esc(e.address||'')}">
     <input class="er-sni" dir="ltr" placeholder="SNI / Host (optional)" value="${esc(e.sni||'')}">
     <input class="er-name" placeholder="${lang==='fa'?'نام (اختیاری)':'Name (optional)'}" value="${esc(e.name||'')}" style="grid-column:1 / -1">
@@ -7853,11 +7238,10 @@ function addEntryRow(id,e){
   if(box.querySelectorAll('.entry-row').length>=40){toast(lang==='fa'?'حداکثر ۴۰ ردیف':'Max 40 rows');return}
   box.insertAdjacentHTML('beforeend',entryRowHtml(e));
 }
-function addAllEntryRows(id){ENTRY_PROTOS.forEach(([v])=>addEntryRow(id,{protocol:v}))}
 function renderEntries(id,list){document.getElementById(id).innerHTML='';(list||[]).forEach(e=>addEntryRow(id,e))}
 function readEntries(id){
   return [...document.querySelectorAll('#'+id+' .entry-row')].map(r=>({
-    protocol:r.querySelector('.er-proto').value,
+    protocol:'vless-ws',
     address:r.querySelector('.er-addr').value.trim(),
     sni:r.querySelector('.er-sni').value.trim(),
     name:r.querySelector('.er-name').value.trim()
@@ -7868,15 +7252,13 @@ async function loadSettings(){
     const r=await api('/api/settings');
     if(!r)return;
     const inp=document.getElementById('sDefaultName');
-    if(inp&&document.activeElement!==inp)inp.value=r.default_name||'';
+    if(inp&&document.activeElement!==inp)inp.value=r.default_config_name||'';
     const nx=document.getElementById('sDefaultNext');
-    if(nx)nx.textContent=r.next_name?((lang==='fa'?'نام بعدی: ':'Next name: ')+r.next_name):'';
-    const cn=document.getElementById('cName');
-    if(cn)cn.placeholder=r.next_name||'auto';
+    if(nx)nx.textContent=r.preview?((lang==='fa'?'نمونه: ':'Preview: ')+r.preview):'';
   }catch(e){}
 }
 async function saveDefaultName(){
-  const r=await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({default_name:document.getElementById('sDefaultName').value})});
+  const r=await api('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({default_config_name:document.getElementById('sDefaultName').value})});
   if(r){toast(lang==='fa'?'ذخیره شد':'Saved');loadSettings()}
 }
 function openEdit(uid){
@@ -8204,7 +7586,7 @@ async function downloadBackup(kind){
     const a = document.createElement('a');
     const stamp = new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
     a.href = URL.createObjectURL(blob);
-    a.download = kind==='bot' ? ('pxpanel-bot-'+stamp+'.json') : ('pxpanel-users-'+stamp+'.json');
+    a.download = kind==='bot' ? ('aurora-bot-'+stamp+'.json') : ('aurora-users-'+stamp+'.json');
     document.body.appendChild(a);
     a.click();
     setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); }, 500);
